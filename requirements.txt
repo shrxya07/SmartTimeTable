@@ -1,0 +1,10 @@
+streamlit
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+pandas
+openpyxl
+PyMuPDF
+pytest
+httpx
