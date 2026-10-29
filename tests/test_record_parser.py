@@ -45,3 +45,42 @@ def test_unknown_text_is_flagged():
     record = parse_timetable_cell(make_cell("UNREADABLE TEXT"))
     assert record["teacher_name"] == "UNKNOWN"
     assert record["review_status"] == "needs_review"
+def test_semester_v_subject_is_recognized():
+    record = parse_timetable_cell(
+        make_cell("AIML")
+    )
+
+    assert record["subject"] == (
+        "Artificial Intelligence and Machine Learning"
+    )
+    assert record["teacher_name"] == "UNKNOWN"
+    assert record["review_status"] == "needs_review"
+
+
+def test_semester_v_dcn_lab_is_not_misclassified():
+    record = parse_timetable_cell(
+        make_cell("DCN LAB (NSB, PN, PK) CSE LAB 2")
+    )
+
+    assert record["subject"] != "Data Communication and Networking"
+    assert record["teacher_name"] == "UNKNOWN"
+    assert record["review_status"] == "needs_review"
+
+
+def test_semester_vii_microservices_lab_is_recognized():
+    record = parse_timetable_cell(
+        make_cell("MICROSERVICES LAB (JGR, BG, SK)")
+    )
+
+    assert record["subject"] == "Microservices Laboratory"
+    assert record["teacher_name"] == "UNKNOWN"
+    assert record["review_status"] == "needs_review"
+
+
+def test_semester_vii_internship_is_recognized():
+    record = parse_timetable_cell(
+        make_cell("INTERNSHIP/PROJECT")
+    )
+
+    assert record["subject"] == "Internship / Project"
+    assert record["review_status"] == "needs_review"

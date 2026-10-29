@@ -109,7 +109,7 @@ def get_merged_periods(merged_cell):
     ]
 
 
-def extract_cells(image_path=IMAGE_PATH):
+def extract_cells(image_path=IMAGE_PATH, merged_cells=None):
     """Extract timetable cells and combine known merged periods."""
     crop_path = crop_timetable_area(image_path)
     image = cv2.imread(str(crop_path))
@@ -146,7 +146,7 @@ def extract_cells(image_path=IMAGE_PATH):
         merged_period_indexes = set()
 
         # First extract known merged cells as single records.
-        for merged in MERGED_CELLS:
+        for merged in (MERGED_CELLS if merged_cells is None else merged_cells):
             if merged["day"] != day:
                 continue
 

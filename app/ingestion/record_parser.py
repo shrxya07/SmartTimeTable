@@ -18,6 +18,31 @@ SUBJECTS = {
     "INDUSTRY TALK / TRAINING": "Industry Talk / Training",
     "AM31": "AM31 - Lateral Entry",
     "PARTIAL DELIVERY": "Partial Delivery",
+        # Semester V
+    "DCN": "Data Communication and Networking",
+    "AIML": "Artificial Intelligence and Machine Learning",
+    "OOAD/BDA": "Object-Oriented Analysis and Design / Big Data Analytics",
+    "RM&IPR": "Research Methodology and Intellectual Property Rights",
+    "SE&M": "Software Engineering and Modelling",
+    "FAFL": "Formal Languages and Automata Theory",
+    "EVS": "Environmental Studies",
+    "NOSQL/PE": "NoSQL / PE",
+    "FSD": "Full Stack Development",
+    "SERM": "Software Engineering and Modelling",
+
+    # Semester VII
+    "MAP": "MAP",
+    "SAN": "SAN",
+    "OE": "Open Elective",
+    "CD": "CD",
+    "MICROSERVICE LAB": "Microservices Laboratory",
+    "SKILL ENHANCEMENT LAB": "Skill Enhancement Laboratory",
+    "SKILL ENHANCEMENT TUT": "Skill Enhancement Tutorial",
+    "INTERNSHIP/PROJECT": "Internship / Project",
+    "PROCTOR-STUDENT MEETING": "Proctor-Student Meeting",
+    "COLLEGE/DEPT. ACTIVITIES": "College / Department Activities",
+    "DCN LAB": "Data Communication and Networking Laboratory",
+"MICROSERVICES LAB": "Microservices Laboratory",
 }
 
 TEACHERS = {
@@ -75,7 +100,8 @@ def parse_timetable_cell(
     # Prefer specific course names before shorter abbreviations.
     subject_key = None
     for candidate in sorted(SUBJECTS, key=len, reverse=True):
-        if candidate in upper:
+        pattern = rf"(?<![A-Z0-9]){re.escape(candidate)}(?![A-Z0-9])"
+        if re.search(pattern, upper):
             subject_key = candidate
             break
 
@@ -100,9 +126,16 @@ def parse_timetable_cell(
 
     # Teacher names for labs and special sessions cannot be safely
     # inferred from abbreviations alone.
-    if subject_key in {"DS LAB", "OOP LAB", "AM31", "SKILL LAB-II",
-                       "INDUSTRY TALK / TRAINING", "PARTIAL DELIVERY"}:
-        teacher = "UNKNOWN"
+    if subject_key and (
+    subject_key.endswith("LAB")
+    or subject_key in {
+        "AM31",
+        "INDUSTRY TALK / TRAINING",
+        "PARTIAL DELIVERY",
+        "INTERNSHIP/PROJECT",
+    }
+):
+     teacher = "UNKNOWN"
 
     return {
         "teacher_name": teacher,
