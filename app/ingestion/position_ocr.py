@@ -25,7 +25,10 @@ def extract_positioned_words(image_path):
 
     crop_path = crop_timetable_area(image_path)
     crop = cv2.imread(str(crop_path))
-
+    if crop is None:
+        raise FileNotFoundError(
+        f"Cannot read cropped timetable image: {crop_path}"
+    )
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(
         gray, None, fx=1.5, fy=1.5,

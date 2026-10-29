@@ -99,8 +99,18 @@ MERGED_CELLS = [
 ]
 
 
+def get_merged_periods(merged_cell):
+    """Return the teaching periods covered by a merged cell."""
+    return [
+        period
+        for period in PERIODS
+        if period[2] >= merged_cell["start"]
+        and period[3] <= merged_cell["end"]
+    ]
+
+
 def extract_cells(image_path=IMAGE_PATH):
-    """Extract OCR words and group them by weekday and time period."""
+    """Extract timetable cells and combine known merged periods."""
     crop_path = crop_timetable_area(image_path)
     image = cv2.imread(str(crop_path))
 
@@ -113,35 +123,101 @@ def extract_cells(image_path=IMAGE_PATH):
         output_type=Output.DICT,
     )
 
+    # Collect valid OCR words with their center coordinates.
+    words = []
+    for i, raw_text in enumerate(data["text"]):
+        text = raw_text.strip()
+        if not text:
+            continue
+
+        x = data["left"][i] + data["width"][i] / 2
+        y = data["top"][i] + data["height"][i] / 2
+        words.append((y, x, text))
+
     records = []
 
     for day, top, bottom in ROWS:
-        for left, right, start, end in PERIODS:
-            cell_words = []
+        day_words = [
+            word for word in words
+            if top <= word[0] < bottom
+        ]
 
-            for i, raw_text in enumerate(data["text"]):
-                text = raw_text.strip()
-                if not text:
-                    continue
+        # Period indexes already represented by a merged cell.
+        merged_period_indexes = set()
 
-                x = data["left"][i] + data["width"][i] / 2
-                y = data["top"][i] + data["height"][i] / 2
+        # First extract known merged cells as single records.
+        for merged in MERGED_CELLS:
+            if merged["day"] != day:
+                continue
 
-                if top <= y < bottom and left <= x < right:
-                    cell_words.append((y, x, text))
+            covered = [
+                (index, period)
+                for index, period in enumerate(PERIODS)
+                if period[2] >= merged["start"]
+                and period[3] <= merged["end"]
+            ]
+
+            if not covered:
+                continue
+
+            first_index, first_period = covered[0]
+            last_index, last_period = covered[-1]
+
+            left = first_period[0]
+            right = last_period[1]
+
+            cell_words = [
+                word for word in day_words
+                if left <= word[1] < right
+            ]
+
+            cell_words.sort(key=lambda word: (word[0], word[1]))
+            text = " ".join(word[2] for word in cell_words)
+
+            if text:
+                records.append({
+                    "day": day,
+                    "start_time": merged["start"],
+                    "end_time": merged["end"],
+                    "text": text,
+                    "review_status": "needs_review",
+                })
+
+            merged_period_indexes.update(
+                index for index, _ in covered
+            )
+
+        # Extract ordinary periods not covered by a merged cell.
+        for index, (left, right, start, end) in enumerate(PERIODS):
+            if index in merged_period_indexes:
+                continue
+
+            cell_words = [
+                word for word in day_words
+                if left <= word[1] < right
+            ]
+
+            cell_words.sort(key=lambda word: (word[0], word[1]))
 
             if cell_words:
-                cell_words.sort(key=lambda item: (item[0], item[1]))
-
                 records.append({
                     "day": day,
                     "start_time": start,
                     "end_time": end,
-                    "text": " ".join(item[2] for item in cell_words),
+                    "text": " ".join(word[2] for word in cell_words),
                     "review_status": "needs_review",
                 })
 
-    return records
+    return sorted(
+        records,
+        key=lambda record: (
+            ROWS.index(next(
+                row for row in ROWS if row[0] == record["day"]
+            )),
+            record["start_time"],
+        ),
+    )
+
 
 
 if __name__ == "__main__":

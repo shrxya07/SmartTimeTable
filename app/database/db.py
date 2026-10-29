@@ -1,4 +1,4 @@
-
+﻿
 import sqlite3
 from pathlib import Path
 
@@ -120,18 +120,18 @@ def insert_entry(entry, connection=None):
 
     if connection is not None:
         cursor = connection.execute(
-          f"""
-          INSERT INTO timetable_entries ({", ".join(columns)})
-          VALUES ({", ".join("?" for _ in columns)})
-          """,
-          values,
-        )
+        f"""
+        INSERT INTO timetable_entries ({", ".join(columns)})
+        VALUES ({", ".join("?" for _ in columns)})
+        """,
+       values,
+    )
         return cursor.lastrowid
 
     with get_connection() as connection:
         cursor = connection.execute(
           f"""
-          INSERT INTO timetable_entries ({", ".join("?" for _ in columns)})
+          INSERT INTO timetable_entries ({", ".join(columns)})
           VALUES ({", ".join("?" for _ in columns)})
           """,
           values,

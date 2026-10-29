@@ -3,7 +3,10 @@ from pathlib import Path
 
 from app.ingestion.ocr_reader import extract_text_from_image
 
-image_path = Path("data/uploads/timetable.jpeg")
+image_path = Path("data/uploads/cse_sem3_a.png")
+
+if not image_path.exists():
+    raise FileNotFoundError(f"Test image not found: {image_path}")
 
 text = extract_text_from_image(image_path)
 

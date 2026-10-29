@@ -131,18 +131,21 @@ def detect_conflicts(day=None):
 
     return conflicts
 
+
+
 def find_free_slots(
     teacher_name,
     day,
     min_duration_minutes=60,
     working_start="09:00",
     working_end="17:00",
+    breaks=None,
 ):
     """
     Find gaps in a teacher's schedule during working hours.
 
-    Returns free intervals long enough to meet the minimum duration.
-    Assumes classes occur within the same day.
+    Optional breaks is a list of (start_time, end_time) tuples.
+    Example: [("10:50", "11:05"), ("12:55", "13:45")]
     """
     if min_duration_minutes <= 0:
         raise ValueError("Minimum duration must be positive")
@@ -155,21 +158,39 @@ def find_free_slots(
 
     schedule = find_teacher_schedule(teacher_name, day)
 
-    intervals = sorted(
+    intervals = [
         (
             max(_to_minutes(entry["start_time"]), day_start),
             min(_to_minutes(entry["end_time"]), day_end),
         )
         for entry in schedule
-    )
+    ]
 
-    free_slots = []
-    current = day_start
+    for break_start, break_end in (breaks or []):
+        intervals.append((
+            max(_to_minutes(break_start), day_start),
+            min(_to_minutes(break_end), day_end),
+        ))
 
+    intervals.sort()
+
+    merged = []
     for start, end in intervals:
         if start >= end:
             continue
 
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (
+                merged[-1][0],
+                max(merged[-1][1], end),
+            )
+        else:
+            merged.append((start, end))
+
+    free_slots = []
+    current = day_start
+
+    for start, end in merged:
         if start > current and start - current >= min_duration_minutes:
             free_slots.append({
                 "start_time": f"{current // 60:02d}:{current % 60:02d}",
