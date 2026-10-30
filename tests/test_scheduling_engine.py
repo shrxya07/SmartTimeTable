@@ -1,6 +1,5 @@
 
 import pytest
-
 from app.database import db
 from app.scheduling.engine import (
     find_teacher_schedule,
@@ -9,6 +8,9 @@ from app.scheduling.engine import (
     find_room_at_time,
     detect_conflicts,
     find_free_slots,
+    find_room_free_slots,
+    find_section_free_slots,
+    find_common_free_slots,
 )
 
 
@@ -29,6 +31,9 @@ def add_entry(
     start="09:00",
     end="10:00",
     room="Room 301",
+    semester=None,
+    section=None,
+    review_status="verified",
 ):
     return db.insert_entry({
         "teacher_name": teacher,
@@ -38,7 +43,9 @@ def add_entry(
         "start_time": start,
         "end_time": end,
         "room": room,
-        "review_status": "verified",
+        "semester": semester,
+        "section": section,
+        "review_status": review_status,
     })
 
 
@@ -148,7 +155,7 @@ def test_free_slots_reject_invalid_duration(test_database):
         find_free_slots("Dr Rao", "Monday", min_duration_minutes=0)
 
 
-def test_free_slots_respect_configured_breaks():
+def test_free_slots_respect_configured_breaks(test_database):
     add_entry(start="09:00", end="09:55")
 
     slots = find_free_slots(
@@ -169,4 +176,133 @@ def test_free_slots_respect_configured_breaks():
             "end_time": "12:55",
             "duration_minutes": 110,
         }
+    ]
+
+def test_room_free_slots(test_database):
+    add_entry(start="10:00", end="11:00", room="Room 301")
+    add_entry(start="13:00", end="14:00", room="Room 301")
+
+    slots = find_room_free_slots(
+        "Room 301",
+        "Monday",
+        working_start="09:00",
+        working_end="15:00",
+    )
+
+    assert slots == [
+        {"start_time": "09:00", "end_time": "10:00", "duration_minutes": 60},
+        {"start_time": "11:00", "end_time": "13:00", "duration_minutes": 120},
+        {"start_time": "14:00", "end_time": "15:00", "duration_minutes": 60},
+    ]
+
+
+def test_section_free_slots(test_database):
+    add_entry(class_name="CSE-A", start="10:00", end="11:00")
+
+    slots = find_section_free_slots(
+        "CSE-A",
+        "Monday",
+        working_start="09:00",
+        working_end="12:00",
+    )
+
+    assert slots == [
+        {"start_time": "09:00", "end_time": "10:00", "duration_minutes": 60},
+        {"start_time": "11:00", "end_time": "12:00", "duration_minutes": 60},
+    ]
+
+
+def test_common_free_slots_for_teachers(test_database):
+    add_entry(teacher="Dr Rao", start="09:00", end="10:00")
+    add_entry(teacher="Dr Sen", start="10:00", end="11:00")
+
+    slots = find_common_free_slots(
+        ["Dr Rao", "Dr Sen"],
+        "teacher",
+        "Monday",
+        working_start="09:00",
+        working_end="13:00",
+    )
+
+    assert slots == [
+        {"start_time": "11:00", "end_time": "13:00", "duration_minutes": 120}
+    ]
+
+
+def test_common_free_slots_for_sections(test_database):
+    add_entry(class_name="CSE-A", start="09:00", end="10:00")
+    add_entry(class_name="CSE-B", start="10:00", end="11:00")
+
+    slots = find_common_free_slots(
+        ["CSE-A", "CSE-B"],
+        "section",
+        "Monday",
+        working_start="09:00",
+        working_end="13:00",
+    )
+
+    assert slots == [
+        {"start_time": "11:00", "end_time": "13:00", "duration_minutes": 120}
+    ]
+
+
+def test_common_free_slots_respect_semester(test_database):
+    add_entry(
+        teacher="Dr Rao",
+        start="09:00",
+        end="10:00",
+        semester=3,
+    )
+    add_entry(
+        teacher="Dr Sen",
+        start="10:00",
+        end="11:00",
+        semester=3,
+    )
+
+    # These Semester 5 entries must not affect the result.
+    add_entry(
+        teacher="Dr Rao",
+        start="11:00",
+        end="12:00",
+        semester=5,
+    )
+    add_entry(
+        teacher="Dr Sen",
+        start="11:00",
+        end="12:00",
+        semester=5,
+    )
+
+    slots = find_common_free_slots(
+        ["Dr Rao", "Dr Sen"],
+        "teacher",
+        "Monday",
+        semester=3,
+        working_start="09:00",
+        working_end="13:00",
+    )
+
+    assert slots == [
+        {"start_time": "11:00", "end_time": "13:00", "duration_minutes": 120}
+    ]
+
+
+def test_unverified_records_excluded_by_default(test_database):
+    add_entry(
+        teacher="Dr Rao",
+        start="09:00",
+        end="10:00",
+        review_status="needs_review",
+    )
+
+    slots = find_free_slots(
+        "Dr Rao",
+        "Monday",
+        working_start="09:00",
+        working_end="11:00",
+    )
+
+    assert slots == [
+        {"start_time": "09:00", "end_time": "11:00", "duration_minutes": 120}
     ]

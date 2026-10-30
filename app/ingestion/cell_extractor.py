@@ -111,12 +111,25 @@ def get_merged_periods(merged_cell):
 
 def extract_cells(image_path=IMAGE_PATH, merged_cells=None):
     """Extract timetable cells and combine known merged periods."""
-    crop_path = crop_timetable_area(image_path)
+    crop_path = crop_timetable_area(
+    image_path,
+    output_path=Path(image_path).with_name(
+        f"{Path(image_path).stem}_crop.png"
+    ),
+)
     image = cv2.imread(str(crop_path))
 
     if image is None:
         raise ValueError(f"Could not read image: {crop_path}")
-
+    # Existing PERIODS and ROWS coordinates are calibrated for
+    # # the Semester III-A crop. Normalize dimensions before using them.
+    reference_width = PERIODS[-1][1]
+    reference_height = ROWS[-1][2]
+    image = cv2.resize(
+      image,
+      (reference_width, reference_height),
+      interpolation=cv2.INTER_CUBIC,
+    )
     data = pytesseract.image_to_data(
         image,
         config="--psm 11",

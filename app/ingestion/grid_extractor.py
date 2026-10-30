@@ -78,35 +78,62 @@ def detect_timetable_grid(image_path, output_path=None):
     }
 
 
-def crop_timetable_area(image_path, output_path=None):
-    """Save a crop containing the timetable schedule, excluding the course legend."""
-    image_path = Path(image_path)
-    image = cv2.imread(str(image_path))
 
+def crop_timetable_area(
+    image_path,
+    output_path=None,
+    crop_bounds=None,
+):
+    """Crop the timetable schedule, optionally using custom bounds.
+
+    crop_bounds is (x1, y1, x2, y2), expressed as proportions
+    between 0.0 and 1.0 of the original image dimensions.
+    """
+    image_path = Path(image_path)
+
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"Could not read image: {image_path}")
 
     height, width = image.shape[:2]
 
-    # Approximate schedule area based on the current timetable layout.
-    # These proportions should be checked against other timetable templates.
-    x1 = int(width * 0.08)
-    x2 = int(width * 0.88)
-    y1 = int(height * 0.18)
-    y2 = int(height * 0.52)
+    if crop_bounds is None:
+        crop_bounds = (0.08, 0.18, 0.88, 0.52)
+
+    left_ratio, top_ratio, right_ratio, bottom_ratio = crop_bounds
+
+    if not (
+        0 <= left_ratio < right_ratio <= 1
+        and 0 <= top_ratio < bottom_ratio <= 1
+    ):
+        raise ValueError("crop_bounds must be valid image proportions.")
+
+    x1 = int(width * left_ratio)
+    y1 = int(height * top_ratio)
+    x2 = int(width * right_ratio)
+    y2 = int(height * bottom_ratio)
 
     cropped = image[y1:y2, x1:x2]
 
+    if cropped.size == 0:
+        raise ValueError(f"Crop is empty for image: {image_path}")
+
     if output_path is None:
         output_path = image_path.with_name(
-            image_path.stem + "_schedule_crop.png"
+            f"{image_path.stem}_schedule_crop.png"
         )
 
     output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
     if not cv2.imwrite(str(output_path), cropped):
         raise OSError(f"Could not save crop: {output_path}")
 
     return output_path
+
 
 
 
@@ -313,6 +340,114 @@ def inspect_vertical_segments(image_path):
     cv2.imwrite(str(output_path), overlay)
     print("\nOverlay saved to:", output_path)
 
+
+def detect_grid_coordinates(image_path, output_path=None):
+    """Return likely horizontal and vertical timetable grid lines."""
+    import numpy as np
+
+    image_path = Path(image_path)
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Could not read image: {image_path}")
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    binary = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 31, 10,
+    )
+
+    height, width = binary.shape
+
+    horizontal = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (max(20, width // 35), 1)
+        ),
+    )
+    vertical = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, max(20, height // 35))
+        ),
+    )
+
+    def group_positions(positions, tolerance=5):
+        groups = []
+        for value in positions:
+            value = int(value)
+            if not groups or value - groups[-1][-1] > tolerance:
+                groups.append([value])
+            else:
+                groups[-1].append(value)
+        return [
+            round(sum(group) / len(group))
+            for group in groups
+        ]
+
+    # Count detected line pixels along each image axis.
+    y_projection = np.count_nonzero(horizontal, axis=1)
+    x_projection = np.count_nonzero(vertical, axis=0)
+
+    # Require evidence across a substantial portion of the image.
+    y_candidates = np.where(y_projection >= width * 0.25)[0]
+    x_candidates = np.where(x_projection >= height * 0.20)[0]
+
+    y_lines = group_positions(y_candidates)
+    x_lines = group_positions(x_candidates)
+
+    overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    for y in y_lines:
+        cv2.line(overlay, (0, y), (width - 1, y), (0, 0, 255), 2)
+    for x in x_lines:
+        cv2.line(overlay, (x, 0), (x, height - 1), (255, 0, 0), 2)
+
+    if output_path is None:
+        output_path = image_path.with_name(
+            image_path.stem + "_grid_coordinates.png"
+        )
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(output_path), overlay):
+        raise OSError(f"Could not save grid overlay: {output_path}")
+
+    return {
+        "width": width,
+        "height": height,
+        "x_lines": x_lines,
+        "y_lines": y_lines,
+        "debug_image": str(output_path),
+    }
+
+def detect_schedule_region(image_path):
+    """Estimate the timetable body using detected horizontal grid lines."""
+    result = detect_grid_coordinates(image_path)
+    y_lines = result["y_lines"]
+
+    # Candidate rows must have a reasonable vertical distance between
+    # consecutive borders. The largest lower section is often the legend.
+    gaps = [
+        (y_lines[i + 1] - y_lines[i], i)
+        for i in range(len(y_lines) - 1)
+    ]
+
+    if len(gaps) < 4:
+        raise ValueError("Not enough horizontal lines to identify schedule.")
+
+    # Return the line coordinates for inspection before using them
+    # for OCR or database imports.
+    return {
+        "image": str(image_path),
+        "schedule_candidates": y_lines,
+        "gaps": gaps,
+        "debug_image": result["debug_image"],
+    }
 
 if __name__ == "__main__":
     inspect_vertical_segments("data/uploads/cse_sem3_a.png")
