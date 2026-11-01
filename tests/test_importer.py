@@ -94,3 +94,22 @@ def test_import_and_replace_timetable(test_database):
     assert len(matching) == 1
     assert matching[0]["subject"] == "Networks"
     assert matching[0]["room"] == "LHC 301"
+def test_empty_import_does_not_delete_existing_timetable(test_database):
+    import_timetable_records(
+        [valid_record()],
+        default_room="LHC 301",
+        semester=3,
+        section="A",
+        timetable_id="test_sem3_a",
+    )
+
+    result = import_timetable_records(
+        [],
+        timetable_id="test_sem3_a",
+    )
+
+    assert result[0]["status"] == "not_imported"
+
+    entries = db.get_all_entries()
+    assert len(entries) == 1
+    assert entries[0]["subject"] == "DBMS"

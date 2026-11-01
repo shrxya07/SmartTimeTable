@@ -27,7 +27,16 @@ def import_timetable_records(
 
     if not timetable_id:
         raise ValueError("timetable_id is required for safe replacement")
+    records = list(records or [])
 
+    if not records:
+        return [{
+            "status": "not_imported",
+            "reason": (
+                "No records supplied. "
+                "Existing timetable data was left unchanged."
+            ),
+        }]
     prepared = []
     results = []
 
