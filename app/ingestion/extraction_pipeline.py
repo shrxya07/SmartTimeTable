@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app.ingestion.document_processor import process_timetable_image
 from app.ingestion.document_intelligence import interpret_timetable_document
-
+from app.ingestion.cell_extractor import extract_cells_from_evidence
 
 def run_extraction_pipeline(
     image_path,
@@ -29,7 +29,20 @@ def run_extraction_pipeline(
         image_path=image_path,
         tesseract_cmd=tesseract_cmd,
     )
-
+    # Step 1B: Detect grid geometry and assign OCR words to cells.
+    try:
+        cell_evidence = extract_cells_from_evidence(
+            image_path=image_path,
+            ocr_evidence=ocr_evidence,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        cell_evidence = {
+        "cells": [],
+        "merged_candidates": [],
+        "error": str(exc),
+        "review_status": "needs_review",
+    }
+    ocr_evidence["cell_evidence"] = cell_evidence
     source_document = metadata.get(
         "source_document", image_path.name
     )

@@ -7,7 +7,7 @@ coordinates without assuming a particular semester or section.
 import cv2
 import numpy as np
 from pathlib import Path
-
+import os
 from app.ingestion.grid_extractor import detect_grid_coordinates
 
 
@@ -74,14 +74,17 @@ def detect_grid_geometry(image_path):
             })
 
     return {
-        "image": str(image_path),
-        "width": width,
-        "height": height,
-        "x_lines": x_lines,
-        "y_lines": y_lines,
-        "candidate_cells": candidate_cells,
-        "debug_image": result.get("debug_image"),
-    }
+    "image": str(image_path),
+    "width": width,
+    "height": height,
+    "x_lines": x_lines,
+    "y_lines": y_lines,
+    "candidate_cells": candidate_cells,
+    "schedule_top": result.get("schedule_top"),
+    "schedule_bottom": result.get("schedule_bottom"),
+    "detected_weekdays": result.get("detected_weekdays", []),
+    "debug_image": result.get("debug_image"),
+}
 
 def inspect_local_boundaries(
     image_path,
@@ -324,7 +327,117 @@ def inspect_morphological_boundaries(image_path, geometry=None):
         "horizontal_kernel_length": horizontal_length,
     }
 
+
 def inspect_row_wise_boundaries(image_path, geometry=None, threshold=180):
+    """Measure vertical boundary strength separately in each schedule row."""
+    image_path = Path(image_path)
+
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    if geometry is None:
+        geometry = detect_grid_geometry(image_path)
+
+    gray = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+    if gray is None:
+        raise ValueError(f"Could not read image: {image_path}")
+
+    height, width = gray.shape
+
+    x_lines = sorted(set(geometry["x_lines"]))
+    y_lines = sorted(set(geometry["y_lines"]))
+
+    # Ignore image edges; they are not timetable separators.
+    x_lines = [
+        x for x in x_lines
+        if 0 < x < width - 1
+    ]
+
+    if len(x_lines) < 2 or len(y_lines) < 2:
+        return []
+
+    binary = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        31,
+        10,
+    )
+
+    row_heights = [
+        y_lines[i + 1] - y_lines[i]
+        for i in range(len(y_lines) - 1)
+        if y_lines[i + 1] > y_lines[i]
+    ]
+
+    if not row_heights:
+        return []
+
+    # Shorter kernel preserves evidence in individual timetable rows.
+    vertical_length = max(
+        8, min(20, int(np.median(row_heights) // 3))
+    )
+
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, vertical_length),
+    )
+
+    vertical_mask = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        vertical_kernel,
+    )
+
+    results = []
+
+    for row_index in range(len(y_lines) - 1):
+        y1 = y_lines[row_index]
+        y2 = y_lines[row_index + 1]
+
+        if y1 < 0 or y2 > height or y2 <= y1:
+            continue
+
+        row_height = y2 - y1
+        inset = max(2, int(row_height * 0.10))
+
+        inner_y1 = y1 + inset
+        inner_y2 = y2 - inset
+
+        if inner_y2 <= inner_y1:
+            continue
+
+        row_boundaries = []
+
+        for x in x_lines:
+            left = max(0, x - 2)
+            right = min(width, x + 3)
+
+            region = vertical_mask[
+                inner_y1:inner_y2, left:right
+            ]
+
+            coverage = (
+                float(np.any(region > 0, axis=1).mean())
+                if region.size else 0.0
+            )
+
+            row_boundaries.append({
+                "x": x,
+                "coverage": round(coverage, 3),
+                "likely_present": coverage >= 0.35,
+            })
+
+        results.append({
+            "row_index": row_index,
+            "y_start": y1,
+            "y_end": y2,
+            "boundaries": row_boundaries,
+        })
+
+    return results
+
     """
     Measure vertical grid-line strength separately inside each row.
 

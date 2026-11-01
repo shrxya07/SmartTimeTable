@@ -5,7 +5,11 @@ import cv2
 import numpy as np
 import pytesseract
 from pytesseract import Output
-
+from app.ingestion.dynamic_grid import (
+    detect_grid_geometry,
+    inspect_row_wise_boundaries,
+    infer_merged_cells,
+)
 TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 from app.ingestion.grid_extractor import crop_timetable_area
@@ -248,3 +252,94 @@ if __name__ == "__main__":
             f"{record['start_time']}-{record['end_time']}: "
             f"{record['text']}"
         )
+
+def extract_cells_from_evidence(image_path, ocr_evidence):
+    """
+    Assign existing OCR words to dynamically detected timetable cells.
+
+    Grid geometry is measured in original image coordinates, so OCR
+    original_bbox coordinates are used for assignment.
+    """
+    geometry = detect_grid_geometry(image_path)
+
+    row_results = inspect_row_wise_boundaries(
+        image_path,
+        geometry=geometry,
+    )
+
+    merged_candidates = infer_merged_cells(row_results)
+
+    words = ocr_evidence.get("words", [])
+    cells = []
+
+    for row in row_results:
+        boundaries = row["boundaries"]
+
+        # Keep the outer boundaries and internal boundaries
+        # that have sufficient visual evidence.
+        present = [
+            item for item in boundaries
+            if item["likely_present"]
+        ]
+
+        if len(present) < 2:
+            continue
+
+        for left, right in zip(present, present[1:]):
+            x1 = left["x"]
+            x2 = right["x"]
+            y1 = row["y_start"]
+            y2 = row["y_end"]
+
+            cell_words = []
+
+            for word in words:
+                bbox = word.get("original_bbox", {})
+                if not bbox:
+                    continue
+
+                cx = bbox["x"] + bbox["width"] / 2
+                cy = bbox["y"] + bbox["height"] / 2
+
+                if x1 <= cx < x2 and y1 <= cy < y2:
+                    cell_words.append(word)
+
+            cell_words.sort(
+                key=lambda item: (
+                    item["original_bbox"]["y"],
+                    item["original_bbox"]["x"],
+                )
+            )
+
+            text = " ".join(
+                item["text"] for item in cell_words
+            )
+
+            if not text.strip():
+                continue
+
+            is_merged = any(
+                candidate["row_index"] == row["row_index"]
+                and candidate["x_start"] <= x1
+                and candidate["x_end"] >= x2
+                for candidate in merged_candidates
+            )
+
+            cells.append({
+                "row_index": row["row_index"],
+                "x_start": x1,
+                "x_end": x2,
+                "y_start": y1,
+                "y_end": y2,
+                "text": text,
+                "words": cell_words,
+                "is_merged_candidate": is_merged,
+                "review_status": "needs_review",
+            })
+
+    return {
+        "cells": cells,
+        "merged_candidates": merged_candidates,
+        "grid_geometry": geometry,
+        "review_status": "needs_review",
+    }
