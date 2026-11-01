@@ -8,3 +8,7 @@ openpyxl
 PyMuPDF
 pytest
 httpx
+opencv-python
+numpy
+pytesseract
+Pillow

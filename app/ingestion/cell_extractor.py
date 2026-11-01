@@ -159,7 +159,15 @@ def extract_cells(image_path=IMAGE_PATH, merged_cells=None):
         merged_period_indexes = set()
 
         # First extract known merged cells as single records.
-        for merged in (MERGED_CELLS if merged_cells is None else merged_cells):
+        # Apply default merged-cell definitions only to Semester 3-A.
+        if merged_cells is not None:
+            active_merged_cells = merged_cells
+        elif Path(image_path).name.lower() == "cse_sem3_a.png":
+            active_merged_cells = MERGED_CELLS
+        else:
+            active_merged_cells = []
+
+        for merged in active_merged_cells:
             if merged["day"] != day:
                 continue
 
