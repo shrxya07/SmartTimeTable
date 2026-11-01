@@ -1,3 +1,4 @@
+"""Safe, transactional timetable import."""
 
 import sqlite3
 
@@ -14,6 +15,23 @@ REQUIRED_FIELDS = {
     "end_time",
 }
 
+UNKNOWN_VALUES = {"", "UNKNOWN", "N/A", "NA", "NONE", "NULL"}
+
+
+def _clean_value(value):
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if cleaned.upper() in UNKNOWN_VALUES:
+        return None
+    return cleaned
+
+
+def _derive_class_name(semester, section):
+    if semester is None or section is None:
+        return None
+    return f"Semester {semester} Section {section}"
+
 
 def import_timetable_records(
     records,
@@ -23,78 +41,82 @@ def import_timetable_records(
     timetable_id=None,
     source_document=None,
 ):
-    """Replace one timetable's records safely."""
-
+    """Replace one timetable's records safely after validating all records."""
     if not timetable_id:
         raise ValueError("timetable_id is required for safe replacement")
-    records = list(records or [])
 
+    records = list(records or [])
     if not records:
         return [{
             "status": "not_imported",
             "reason": (
-                "No records supplied. "
-                "Existing timetable data was left unchanged."
+                "No records supplied. Existing timetable data was left unchanged."
             ),
         }]
+
     prepared = []
     results = []
 
-    # Validate every record before deleting existing entries.
     for index, record in enumerate(records, start=1):
-        entry = record.copy()
+        entry = dict(record)
         entry["semester"] = semester
         entry["section"] = section
         entry["timetable_id"] = timetable_id
-        entry["source_document"] = (
-            entry.get("source_document") or source_document
+        entry["source_document"] = entry.get("source_document") or source_document
+
+        # The class label is deterministic metadata, not an LLM extraction.
+        entry["class_name"] = (
+            _clean_value(entry.get("class_name"))
+            or _derive_class_name(semester, section)
         )
 
-        missing = [
-            field for field in REQUIRED_FIELDS
-            if not entry.get(field)
-        ]
+        # Preserve raw OCR room evidence separately. UNKNOWN is not a room.
+        original_room = entry.get("original_room_text")
+        if original_room is None:
+            original_room = entry.get("room")
+        entry["original_room_text"] = original_room
 
+        for field in ("teacher_name", "subject", "class_name", "day",
+                      "start_time", "end_time"):
+            entry[field] = _clean_value(entry.get(field))
+
+        missing = [field for field in REQUIRED_FIELDS if not entry.get(field)]
         if missing:
             results.append({
                 "record_number": index,
                 "status": "needs_review",
-                "reason": f"Missing fields: {', '.join(sorted(missing))}",
+                "reason": f"Missing or unresolved fields: {', '.join(sorted(missing))}",
             })
             continue
 
-        original_room = entry.get("room")
+        cell_room = _clean_value(entry.get("room"))
         resolved_room = resolve_room(
-            cell_room=original_room,
-            timetable_default_room=default_room,
+            cell_room=cell_room,
+            timetable_default_room=_clean_value(default_room),
         )
-
         if not resolved_room:
             results.append({
                 "record_number": index,
                 "status": "needs_review",
-                "reason": "No room found in record or timetable header",
+                "reason": "No usable room in record or timetable header",
             })
             continue
 
-        entry["original_room_text"] = original_room
         entry["room"] = resolved_room
         entry.setdefault("review_status", "needs_review")
         prepared.append((index, entry))
 
-    # Do not replace existing data if any record is invalid.
-    if results:
+    # Never delete existing data unless every supplied record is importable.
+    if results or len(prepared) != len(records):
         return results + [{
             "status": "not_imported",
-            "reason": "Replacement cancelled because records need review.",
+            "reason": "Replacement cancelled because one or more records need review.",
         }]
 
     imported_results = []
-
     try:
         with get_connection() as connection:
             connection.execute("BEGIN")
-
             connection.execute(
                 "DELETE FROM timetable_entries WHERE timetable_id = ?",
                 (timetable_id,),
@@ -102,7 +124,6 @@ def import_timetable_records(
 
             for index, entry in prepared:
                 entry_id = insert_entry(entry, connection=connection)
-
                 imported_results.append({
                     "record_number": index,
                     "status": "imported",
@@ -112,11 +133,7 @@ def import_timetable_records(
                     "section": section,
                     "timetable_id": timetable_id,
                 })
-
     except (ValueError, TypeError, sqlite3.Error) as exc:
-        return [{
-            "status": "not_imported",
-            "reason": str(exc),
-        }]
+        return [{"status": "not_imported", "reason": str(exc)}]
 
     return imported_results

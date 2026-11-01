@@ -1,4 +1,3 @@
-
 """Provider-independent LLM-assisted timetable interpretation."""
 
 import json
@@ -15,12 +14,20 @@ Rules:
 1. Extract only information supported by the supplied OCR evidence.
 2. Do not invent teachers, subjects, rooms, days or times.
 3. Preserve the original OCR text for every extracted record.
-4. Identify uncertain or ambiguous information.
-5. Handle merged timetable cells by preserving their actual start and end
+4. Use the exact string UNKNOWN when a value cannot be read; do not guess.
+5. Identify uncertain or ambiguous information.
+6. Handle merged timetable cells by preserving their actual start and end
    times when the evidence supports them.
-6. Return JSON only, following the requested structure.
-7. Use needs_review whenever information is uncertain.
+7. Return JSON only, following the requested structure.
+8. Use needs_review whenever information is uncertain.
 """
+
+
+UNKNOWN_VALUES = {"", "UNKNOWN", "N/A", "NA", "NONE", "NULL"}
+
+
+def _is_unknown(value):
+    return not isinstance(value, str) or value.strip().upper() in UNKNOWN_VALUES
 
 
 def build_extraction_prompt(ocr_text, metadata=None):
@@ -49,15 +56,16 @@ Return this JSON structure:
       "room": "Room name or UNKNOWN",
       "original_text": "Original OCR text",
       "confidence": 0.0,
-      "review_status": "verified or needs_review",
+      "review_status": "needs_review",
       "uncertainties": []
     }}
   ],
   "document_uncertainties": []
 }}
 
-Confidence must be between 0 and 1.
-Never mark a record verified if its essential information is uncertain.
+Use UNKNOWN for unreadable teacher or room values. Do not make up values.
+Confidence must be between 0 and 1. The application, not this model,
+decides whether a record can be imported after human approval.
 """
 
 
@@ -70,8 +78,6 @@ def _extract_json(response):
         raise TypeError("LLM response must be a string or dictionary")
 
     content = response.strip()
-
-    # Support JSON enclosed in Markdown code fences.
     content = re.sub(
         r"^```(?:json)?\s*|\s*```$",
         "",
@@ -86,12 +92,11 @@ def _extract_json(response):
 
 
 def validate_extraction(result):
-    """Validate the structure and flag incomplete records."""
+    """Validate structure and mark unresolved values for human review."""
     if not isinstance(result, dict):
         raise ValueError("Extraction result must be a dictionary")
 
     records = result.get("records")
-
     if not isinstance(records, list):
         raise ValueError("'records' must be a list")
 
@@ -106,7 +111,6 @@ def validate_extraction(result):
     )
 
     validated = []
-
     for index, record in enumerate(records, start=1):
         if not isinstance(record, dict):
             raise ValueError(f"Record {index} must be an object")
@@ -115,13 +119,14 @@ def validate_extraction(result):
         uncertainties = list(record.get("uncertainties") or [])
 
         for field in required:
-            if not isinstance(record.get(field), str) or not record[field].strip():
+            value = record.get(field)
+            if not isinstance(value, str) or not value.strip():
                 uncertainties.append(f"Missing or invalid {field}")
-
-        confidence = record.get("confidence", 0)
+            elif _is_unknown(value) and field != "original_text":
+                uncertainties.append(f"Unresolved {field}")
 
         try:
-            confidence = float(confidence)
+            confidence = float(record.get("confidence", 0))
         except (TypeError, ValueError):
             confidence = 0
 
@@ -131,47 +136,28 @@ def validate_extraction(result):
 
         record["confidence"] = confidence
         record["uncertainties"] = sorted(set(uncertainties))
-
-        if record["uncertainties"] or confidence < 0.8:
-            record["review_status"] = "needs_review"
-        else:
-            record["review_status"] = "verified"
-
+        # Model confidence never verifies timetable facts.
+        record["review_status"] = "needs_review"
         validated.append(record)
 
     return {
         "records": validated,
-        "document_uncertainties": result.get(
-            "document_uncertainties", []
-        ),
+        "document_uncertainties": result.get("document_uncertainties", []),
     }
 
 
-def interpret_timetable_document(
-    ocr_evidence,
-    llm_client,
-    metadata=None,
-):
+def interpret_timetable_document(ocr_evidence, llm_client, metadata=None):
     """
     Interpret OCR evidence using an injected LLM client.
 
     Client contract:
         llm_client(system_prompt, user_prompt) -> JSON string or dict
-
-    The application does not depend on a specific LLM provider.
     """
     if not callable(llm_client):
         raise TypeError("llm_client must be callable")
-
     if not ocr_evidence:
         raise ValueError("OCR evidence cannot be empty")
 
-    prompt = build_extraction_prompt(
-        ocr_evidence,
-        metadata=metadata,
-    )
-
+    prompt = build_extraction_prompt(ocr_evidence, metadata=metadata)
     response = llm_client(SYSTEM_PROMPT, prompt)
-    result = _extract_json(response)
-
-    return validate_extraction(result)
+    return validate_extraction(_extract_json(response))

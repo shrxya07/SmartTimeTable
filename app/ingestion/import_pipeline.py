@@ -1,4 +1,3 @@
-
 """Safe handoff from GenAI timetable extraction to the database importer."""
 
 from app.ingestion.extraction_pipeline import run_extraction_pipeline
@@ -11,17 +10,18 @@ REQUIRED_FIELDS = (
     "end_time",
     "subject",
     "teacher_name",
-    "room",
 )
+
+UNKNOWN_VALUES = {"", "UNKNOWN", "N/A", "NA", "NONE", "NULL"}
+
+
+def _usable(value):
+    return value is not None and str(value).strip().upper() not in UNKNOWN_VALUES
 
 
 def validate_import_record(record):
-    """Return missing required fields for a proposed database record."""
-    return [
-        field
-        for field in REQUIRED_FIELDS
-        if not str(record.get(field, "")).strip()
-    ]
+    """Return fields that are missing or unresolved for database insertion."""
+    return [field for field in REQUIRED_FIELDS if not _usable(record.get(field))]
 
 
 def run_import_pipeline(
@@ -36,10 +36,10 @@ def run_import_pipeline(
     tesseract_cmd=None,
 ):
     """
-    Extract records and import only explicitly approved records.
+    Extract records and import only explicitly approved, complete records.
 
-    approved_record_indices refers to zero-based positions in the extracted
-    records list. No records are approved by default.
+    Importer replacement is all-or-nothing: a partial approval must not erase
+    previously imported rows from the same timetable.
     """
     if not timetable_id or not str(timetable_id).strip():
         raise ValueError("A timetable_id is required.")
@@ -56,7 +56,6 @@ def run_import_pipeline(
         raise ValueError("Extraction returned an invalid records collection.")
 
     approved_indices = set(approved_record_indices or [])
-
     invalid_indices = []
     pending_indices = []
     approved_records = []
@@ -67,28 +66,38 @@ def run_import_pipeline(
             continue
 
         missing = validate_import_record(record)
+        # Room may be UNKNOWN only if a real header default is available.
+        if not _usable(record.get("room")) and not _usable(default_room):
+            missing.append("room/default_room")
+
         if missing:
-            invalid_indices.append({
-                "index": index,
-                "missing_fields": missing,
-            })
+            invalid_indices.append({"index": index, "missing_fields": missing})
             continue
 
         if index not in approved_indices:
             pending_indices.append(index)
             continue
 
-        # Approval is an explicit caller action, not an LLM confidence result.
         approved_record = dict(record)
         approved_record["review_status"] = "verified"
+        approved_record["class_name"] = (
+            f"Semester {semester} Section {section}"
+            if semester is not None and section is not None
+            else approved_record.get("class_name")
+        )
         approved_records.append(approved_record)
 
-    # Reject approval indices that do not identify an extracted record.
     invalid_approval_indices = sorted(
         index for index in approved_indices
         if not isinstance(index, int) or index < 0 or index >= len(records)
     )
 
+    # The importer replaces a timetable, so only a complete approval set is safe.
+    valid_indices = {
+        index for index, record in enumerate(records)
+        if isinstance(record, dict) and not validate_import_record(record)
+        and (_usable(record.get("room")) or _usable(default_room))
+    }
     if not approved_records:
         return {
             "status": "nothing_imported",
@@ -99,13 +108,25 @@ def run_import_pipeline(
             "invalid_records": invalid_indices,
             "invalid_approval_indices": invalid_approval_indices,
             "import_results": [],
-            "message": (
-                "No approved valid records were supplied. "
-                "Existing timetable data was left unchanged."
-            ),
+            "message": "No approved valid records. Existing timetable data was left unchanged.",
         }
 
-    source_document = extraction.get("source_document")
+    if invalid_indices or approved_indices.intersection(valid_indices) != valid_indices:
+        return {
+            "status": "awaiting_complete_approval",
+            "timetable_id": timetable_id,
+            "extracted_count": len(records),
+            "approved_count": len(approved_records),
+            "imported_count": 0,
+            "pending_review_indices": pending_indices,
+            "invalid_records": invalid_indices,
+            "invalid_approval_indices": invalid_approval_indices,
+            "import_results": [],
+            "message": (
+                "The importer replaces the whole timetable. Approve every "
+                "valid extracted record and resolve invalid records before import."
+            ),
+        }
 
     import_results = import_timetable_records(
         records=approved_records,
@@ -113,17 +134,17 @@ def run_import_pipeline(
         semester=semester,
         section=section,
         timetable_id=timetable_id,
-        source_document=source_document,
+        source_document=extraction.get("source_document"),
     )
 
     imported_count = sum(
         1 for result in import_results
-        if isinstance(result, dict)
-        and result.get("status") in ("imported", "success")
+        if isinstance(result, dict) and result.get("status") == "imported"
     )
+    status = "import_completed" if imported_count == len(approved_records) else "import_failed"
 
     return {
-        "status": "import_completed",
+        "status": status,
         "timetable_id": timetable_id,
         "extracted_count": len(records),
         "approved_count": len(approved_records),
@@ -132,4 +153,9 @@ def run_import_pipeline(
         "invalid_records": invalid_indices,
         "invalid_approval_indices": invalid_approval_indices,
         "import_results": import_results,
+        "message": (
+            "All approved records were imported."
+            if status == "import_completed"
+            else "Import failed; check import_results. Do not assume data was imported."
+        ),
     }
