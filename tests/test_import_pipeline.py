@@ -76,11 +76,8 @@ def test_only_explicitly_approved_records_are_imported(monkeypatch):
         section="A",
     )
 
-    assert len(captured["records"]) == 1
-    assert captured["records"][0]["review_status"] == "verified"
-    assert captured["timetable_id"] == "sem4_a"
-    assert result["approved_count"] == 1
-    assert result["pending_review_indices"] == [0]
+    assert result["status"] == "awaiting_complete_approval"
+    assert captured == {}
 
 
 def test_invalid_records_are_not_imported(monkeypatch):
@@ -109,8 +106,7 @@ def test_invalid_records_are_not_imported(monkeypatch):
 
     assert result["status"] == "nothing_imported"
     assert result["invalid_records"][0]["index"] == 0
-    assert "room" in result["invalid_records"][0]["missing_fields"]
-
+    assert "room/default_room" in result["invalid_records"][0]["missing_fields"]
 
 def test_missing_timetable_id_is_rejected():
     try:
