@@ -1,14 +1,17 @@
 
 import sqlite3
 
-from app.database.db import get_connection, insert_entry
+from app.database.db import (
+    derive_class_name,
+    get_connection,
+    insert_entry,
+    normalize_missing,
+)
 from app.ingestion.room_resolver import resolve_room
 
 
 REQUIRED_FIELDS = {
-    "teacher_name",
     "subject",
-    "class_name",
     "day",
     "start_time",
     "end_time",
@@ -43,17 +46,92 @@ def import_timetable_records(
     # Validate every record before deleting existing entries.
     for index, record in enumerate(records, start=1):
         entry = record.copy()
-        entry["semester"] = semester
-        entry["section"] = section
+        entry["semester"] = (
+            semester if semester is not None else entry.get("semester")
+        )
+        entry["section"] = (
+            section if section is not None else entry.get("section")
+        )
         entry["timetable_id"] = timetable_id
         entry["source_document"] = (
             entry.get("source_document") or source_document
         )
+        entry["entry_type"] = (
+            normalize_missing(entry.get("entry_type")) or "class"
+        )
+        entry["subject"] = (
+            normalize_missing(entry.get("subject"))
+            or normalize_missing(entry.get("course"))
+        )
+        entry["teacher_name"] = normalize_missing(
+            entry.get("teacher_name")
+        )
+        entry["room"] = normalize_missing(entry.get("room"))
+        entry["class_name"] = (
+            normalize_missing(entry.get("class_name"))
+            or derive_class_name(
+                entry.get("semester"), entry.get("section")
+            )
+        )
 
         missing = [
             field for field in REQUIRED_FIELDS
-            if not entry.get(field)
+            if normalize_missing(entry.get(field)) is None
         ]
+        if not entry.get("class_name"):
+            missing.append("class_name")
+
+        entry_type = str(entry["entry_type"]).casefold()
+        is_activity = entry_type in {"activity", "break"}
+        original_room = record.get("room")
+        entry["original_room_text"] = original_room
+
+        if is_activity:
+            entry["teacher_name"] = None
+            entry["teachers"] = []
+            entry["room"] = None
+            if missing:
+                results.append({
+                    "record_number": index,
+                    "status": "needs_review",
+                    "reason": f"Missing fields: {', '.join(sorted(missing))}",
+                })
+            else:
+                prepared.append((index, entry))
+            continue
+
+        teachers = entry.get("teachers")
+        if isinstance(teachers, (str, dict)):
+            teachers = [teachers]
+        elif teachers is not None:
+            teachers = list(teachers)
+        else:
+            teachers = []
+        valid_teachers = []
+        for teacher in teachers:
+            if isinstance(teacher, dict):
+                teacher_name = normalize_missing(
+                    teacher.get("teacher_name")
+                    or teacher.get("name")
+                    or teacher.get("initials")
+                )
+                if teacher_name is not None:
+                    valid_teachers.append({
+                        **teacher,
+                        "teacher_name": teacher_name,
+                        "initials": normalize_missing(
+                            teacher.get("initials")
+                        ),
+                        "role": normalize_missing(teacher.get("role")),
+                    })
+            else:
+                teacher_name = normalize_missing(teacher)
+                if teacher_name is not None:
+                    valid_teachers.append(teacher_name)
+        entry["teachers"] = valid_teachers
+
+        if entry["teacher_name"] is None and not valid_teachers:
+            missing.append("teacher_name")
 
         if missing:
             results.append({
@@ -63,10 +141,11 @@ def import_timetable_records(
             })
             continue
 
-        original_room = entry.get("room")
-        resolved_room = resolve_room(
-            cell_room=original_room,
-            timetable_default_room=default_room,
+        resolved_room = normalize_missing(
+            resolve_room(
+                cell_room=entry["room"],
+                timetable_default_room=normalize_missing(default_room),
+            )
         )
 
         if not resolved_room:

@@ -100,6 +100,37 @@ Initialize the SQLite database using:
 python -c "from app.database.db import initialize_database; initialize_database()"
 ```
 
+The application also initializes the database on startup.
+
+## Configure Gemini (optional)
+
+Create a `.env` file in the project root:
+
+```text
+GEMINI_API_KEY=your-key-here
+# Optional: override the default model
+GEMINI_MODEL=gemini-3.5-flash-lite
+```
+
+Without `GEMINI_API_KEY` the application still starts. The chat assistant
+and the Gemini extraction fallback are disabled and the UI says so;
+deterministic OCR extraction, review and saving keep working.
+
+## Running the Application
+
+From the project root, with the virtual environment activated, either
+command works:
+
+```powershell
+streamlit run app/streamlit_app.py
+```
+
+```powershell
+python -m streamlit run app/streamlit_app.py
+```
+
+Then open http://localhost:8501.
+
 ## Running Tests
 
 Run the complete automated test suite:
@@ -239,3 +270,37 @@ python -m pytest -q
 ```
 
 Use feature branches for development and integration.
+# SmartTimeTable: reference-table matching patch
+
+## What this patch changes
+
+The timetable image contains two separate data regions: the weekly grid and a lower course/faculty reference table. The existing pipeline OCRs the full page, but its semantic interpretation does not explicitly structure and join the lower table. This patch adds that missing stage.
+
+- `app/ingestion/reference_resolver.py` reads OCR words and bounding boxes, locates the `COURSE CODE / COURSE NAME / FACULTY` table, and parses course abbreviations, faculty aliases, section-specific assignments and rooms.
+- `app/ingestion/extraction_pipeline.py` parses the reference table from full-page OCR and resolves extracted records against it after Gemini interpretation.
+- `app/ingestion/document_intelligence.py` clarifies the LLM's responsibility: distinguish grid cells from reference rows, preserve subgroup identifiers, and avoid inventing missing assignments.
+- `tests/test_reference_resolver.py` tests section-specific OOAD/BDA expansion and activity classification.
+
+## Install
+
+Copy the files in this patch into the matching locations in the project, replacing the two existing ingestion files with the patched versions. Keep the existing `app/ingestion/__init__.py` and other project files unchanged.
+
+Run:
+
+```bash
+python -m unittest discover -s tests -p "test_reference_resolver.py" -v
+```
+
+Then run the existing test suite. No database schema migration is included; `section_group`, `teacher_alias`, `reference_matches`, `record_type` and `uncertainties` are added to the extracted record dictionaries for the review/import layer to persist if its schema supports them.
+
+## Expected Semester 5 behavior
+
+- `OOAD/BDA` expands to the section-specific rows supported by the reference table: OOAD sections 1–3 and BDA section 4, with their listed faculty and LHC rooms.
+- `AEC NOSQL/PE` expands to PE sections 1–3 and NoSQL section 4 where the reference table supports those assignments.
+- Explicit initials in lab text can be resolved when the same reference table contains a full-name/initial pair. Unknown initials remain unresolved.
+- Industry Talk, Proctor-Student Meeting, College/Department Activities, Partial Delivery and Internship/Project are typed as activities rather than being treated as missing course rows.
+- The resolver never marks a record verified. All output remains `needs_review` until independently approved.
+
+## Important limitation
+
+This is a conservative OCR-driven parser, not a universal layout model. Course codes and some labels in the supplied Semester 5 image are noisy, so the parser uses the table's spatial columns and visible row text rather than exact course-code matching. Any table that lacks the expected three-column header, or whose OCR does not preserve enough row structure, is returned as `found: false` or left unresolved. Inspect the returned `reference_table` in the extraction result during the first run before importing records.

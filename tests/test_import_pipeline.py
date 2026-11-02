@@ -148,3 +148,28 @@ def test_empty_extraction_does_not_call_importer(monkeypatch):
 
     assert result["status"] == "nothing_imported"
     assert result["imported_count"] == 0
+
+
+def test_pipeline_does_not_report_success_for_zero_imports(monkeypatch):
+    monkeypatch.setattr(
+        pipeline,
+        "run_extraction_pipeline",
+        lambda **kwargs: fake_extraction([sample_record()]),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "import_timetable_records",
+        lambda **kwargs: [{"status": "not_imported"}],
+    )
+
+    result = pipeline.run_import_pipeline(
+        image_path="sample.png",
+        llm_client=lambda system, prompt: "{}",
+        timetable_id="sem4_a",
+        approved_record_indices=[0],
+        semester=4,
+        section="A",
+    )
+
+    assert result["status"] == "nothing_imported"
+    assert result["imported_count"] == 0

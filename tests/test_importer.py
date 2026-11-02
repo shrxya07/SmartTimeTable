@@ -113,3 +113,75 @@ def test_empty_import_does_not_delete_existing_timetable(test_database):
     entries = db.get_all_entries()
     assert len(entries) == 1
     assert entries[0]["subject"] == "DBMS"
+
+
+def test_real_importer_derives_missing_class_name(test_database):
+    record = valid_record()
+    del record["class_name"]
+
+    result = import_timetable_records(
+        [record],
+        semester=5,
+        section="A",
+        timetable_id="class_name_derived",
+    )
+
+    assert result[0]["status"] == "imported"
+    imported = db.get_all_entries()[0]
+    assert imported["class_name"] == "Semester 5 Section A"
+
+
+def test_activity_imports_with_null_teacher_and_room(test_database):
+    activity = {
+        "entry_type": "activity",
+        "subject": "Industry talk",
+        "teacher_name": "UNKNOWN",
+        "room": "NONE",
+        "day": "Monday",
+        "start_time": "09:00",
+        "end_time": "10:00",
+    }
+
+    result = import_timetable_records(
+        [activity],
+        semester=5,
+        section="A",
+        timetable_id="activity_import",
+    )
+
+    assert result[0]["status"] == "imported"
+    imported = db.get_all_entries()[0]
+    assert imported["teacher_name"] is None
+    assert imported["room"] is None
+    assert imported["class_name"] == "Semester 5 Section A"
+
+
+def test_multiple_teachers_import_with_their_entry(test_database):
+    record = valid_record(
+        teachers=[
+            {"teacher_name": "Dr Rao", "initials": "DR"},
+            {"teacher_name": "Dr Sen", "initials": "DS"},
+        ],
+    )
+
+    result = import_timetable_records(
+        [record],
+        semester=5,
+        section="A",
+        timetable_id="multiple_teachers",
+    )
+
+    assert result[0]["status"] == "imported"
+    with db.get_connection() as connection:
+        teachers = connection.execute(
+            """
+            SELECT teacher_name FROM entry_teachers
+            WHERE entry_id = ?
+            ORDER BY teacher_name
+            """,
+            (result[0]["entry_id"],),
+        ).fetchall()
+    assert [teacher["teacher_name"] for teacher in teachers] == [
+        "Dr Rao",
+        "Dr Sen",
+    ]

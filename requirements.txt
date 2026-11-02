@@ -1,8 +1,7 @@
 streamlit
-fastapi
-uvicorn[standard]
+google-genai
+python-dotenv
 pydantic
-python-multipart
 pandas
 openpyxl
 PyMuPDF

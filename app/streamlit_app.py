@@ -1,18 +1,31 @@
+import json
+import sqlite3
+import sys
 import uuid
 from pathlib import Path
+
+# `streamlit run app/streamlit_app.py` only puts app/ on sys.path, so make the
+# project root importable before importing the `app` package.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd
 import streamlit as st
 
 from app.genai_assistant import (
+    AI_UNAVAILABLE_MESSAGE,
     create_chat_session,
     ask_timetable_assistant,
     gemini_extraction_client,
+    is_ai_available,
 )
 from app.ingestion.extraction_pipeline import run_extraction_pipeline
 from app.database.db import (
+    get_all_entries,
     initialize_database,
     insert_entry,
+    normalize_missing,
     register_timetable,
     update_timetable_status,
 )
@@ -27,8 +40,8 @@ st.set_page_config(
     layout="wide",
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UPLOADS_DIR = PROJECT_ROOT / "data" / "uploads"
+AI_AVAILABLE = is_ai_available()
 
 initialize_database()
 
@@ -68,6 +81,9 @@ with st.sidebar:
     st.metric("Verified timetable entries", verified_count)
     st.caption("Chat answers use verified database records.")
 
+    if not AI_AVAILABLE:
+        st.warning(AI_UNAVAILABLE_MESSAGE)
+
     st.divider()
 
     st.subheader("About")
@@ -104,6 +120,9 @@ if page == "Chat Assistant":
 
     st.title("Timetable Assistant")
     st.write("Ask questions about your verified college timetable.")
+
+    if not AI_AVAILABLE:
+        st.warning(AI_UNAVAILABLE_MESSAGE)
 
     examples = [
         "Show Dr. Rao's timetable on Monday",
@@ -173,13 +192,19 @@ elif page == "Upload Timetable":
 
     st.title("Upload Timetable")
     st.write(
-        "Upload a timetable image. OCR and Gemini will extract "
-        "the schedule for you to review."
+        "Upload a timetable image or PDF. The extracted schedule will "
+        "remain unapproved until you explicitly review and save records."
     )
 
+    if not AI_AVAILABLE:
+        st.info(
+            "Gemini fallback is disabled because GEMINI_API_KEY is not "
+            "configured. Deterministic OCR extraction still runs."
+        )
+
     uploaded_file = st.file_uploader(
-        "Choose a timetable image",
-        type=["png", "jpg", "jpeg"],
+        "Choose a timetable image or PDF",
+        type=["png", "jpg", "jpeg", "pdf"],
     )
 
     col1, col2 = st.columns(2)
@@ -201,11 +226,14 @@ elif page == "Upload Timetable":
         )
 
     if uploaded_file is not None:
-        st.image(
-            uploaded_file,
-            caption="Uploaded timetable",
-            use_container_width=True,
-        )
+        if Path(uploaded_file.name).suffix.casefold() == ".pdf":
+            st.info(f"PDF selected: {uploaded_file.name}")
+        else:
+            st.image(
+                uploaded_file,
+                caption="Uploaded timetable",
+                use_container_width=True,
+            )
 
         if st.button("Extract Timetable", type="primary"):
 
@@ -250,23 +278,31 @@ elif page == "Upload Timetable":
                 ):
                     result = run_extraction_pipeline(
                         image_path=stored_path,
-                        llm_client=gemini_extraction_client,
+                        llm_client=(
+                            gemini_extraction_client
+                            if AI_AVAILABLE
+                            else None
+                        ),
                         metadata=metadata,
                     )
 
                 records = result.get("records", [])
 
-                # Semester and section are authoritative upload metadata.
-                # Do not rely on Gemini to repeat metadata already supplied
-                # by the user. Fill only missing/UNKNOWN class_name values.
-                if class_name:
-                    for record in records:
-                        current_class = str(
-                            record.get("class_name", "")
-                        ).strip()
-
-                        if not current_class or current_class.upper() == "UNKNOWN":
-                            record["class_name"] = class_name
+                for record in records:
+                    if not isinstance(record, dict):
+                        continue
+                    if class_name and normalize_missing(
+                        record.get("class_name")
+                    ) is None:
+                        record["class_name"] = class_name
+                    if normalize_missing(record.get("semester")) is None:
+                        record["semester"] = semester
+                    if normalize_missing(record.get("section")) is None:
+                        record["section"] = section
+                    if normalize_missing(
+                        record.get("source_document")
+                    ) is None:
+                        record["source_document"] = uploaded_file.name
 
                 with st.expander("Debug: OCR text detected"):
                     st.text(
@@ -283,18 +319,40 @@ elif page == "Upload Timetable":
                     with st.expander("Extraction uncertainties"):
                         st.write(result["document_uncertainties"])
 
+                unresolved_items = result.get("unresolved_items") or []
+                if unresolved_items:
+                    with st.expander(
+                        f"Unresolved extraction items ({len(unresolved_items)})"
+                    ):
+                        st.json(unresolved_items)
+
                 st.session_state.current_timetable_id = timetable_id
                 st.session_state.current_timetable_metadata = metadata
                 st.session_state.review_records = records
+                st.session_state.review_unresolved_items = unresolved_items
+                st.session_state.review_extraction_result = result
+                st.session_state.review_save_errors = []
+                st.session_state.review_save_notice = ""
+                st.session_state.review_editor_revision = (
+                    st.session_state.get("review_editor_revision", 0) + 1
+                )
+                st.session_state.bulk_auto_selected_timetable_id = None
 
                 update_timetable_status(
                     timetable_id,
                     "needs_review",
                 )
 
-                st.success(
-                    f"Extraction completed. Found {len(records)} records."
-                )
+                if records:
+                    st.success(
+                        f"Extraction completed. Found {len(records)} "
+                        "reviewable records; none are approved yet."
+                    )
+                else:
+                    st.warning(
+                        "No timetable records were extracted. Review the "
+                        "unresolved items and extraction diagnostics."
+                    )
 
                 if result.get("message"):
                     st.warning(result["message"])
@@ -324,212 +382,609 @@ elif page == "Review Extracted Records":
     records = st.session_state.review_records
     timetable_id = st.session_state.current_timetable_id
     metadata = st.session_state.current_timetable_metadata
+    unresolved_items = st.session_state.get("review_unresolved_items", [])
+    extraction_result = st.session_state.get(
+        "review_extraction_result",
+        {},
+    )
 
     if not timetable_id:
         st.info("Upload and extract a timetable before reviewing records.")
 
-    elif not records:
-        st.info("There are no extracted records waiting for review.")
+    elif not records and not unresolved_items:
+        st.info("There are no extracted records or unresolved items.")
 
     else:
-        st.write(
-            "Check the extracted information carefully. Correct errors "
-            "and select Approve only for records you have verified."
-        )
+        if extraction_result.get("message"):
+            st.warning(extraction_result["message"])
+        if st.session_state.get("review_save_notice"):
+            st.success(st.session_state.review_save_notice)
+        if st.session_state.get("review_save_errors"):
+            st.error("Some records still need attention:")
+            for error in st.session_state.review_save_errors:
+                st.write(f"- {error}")
 
-        st.warning(
-            "Only approved records with all required fields will be "
-            "saved to the database."
-        )
-
-        editable_records = []
-
-        for record in records:
-            editable = {
-                "Approve": False,
-                "day": record.get("day", ""),
-                "start_time": record.get("start_time", ""),
-                "end_time": record.get("end_time", ""),
-                "subject": record.get("subject", ""),
-                "teacher_name": record.get("teacher_name", ""),
-                "class_name": record.get(
-                    "class_name",
-                    metadata.get("class_name", "UNKNOWN"),
-                ),
-                "room": record.get("room", ""),
-                "original_room_text": record.get(
-                    "original_room_text",
-                    record.get("room", ""),
-                ),
-                "source_page": record.get("source_page"),
-            }
-
-            # Also cover records whose class_name was explicitly UNKNOWN.
-            if (
-                str(editable["class_name"]).strip().upper() == "UNKNOWN"
-                and metadata.get("class_name")
+        if unresolved_items:
+            with st.expander(
+                f"Unresolved extraction items ({len(unresolved_items)})",
+                expanded=True,
             ):
-                editable["class_name"] = metadata["class_name"]
+                st.json(unresolved_items)
 
-            editable_records.append(editable)
+        if not records:
+            st.info(
+                "There are no timetable entries to approve. The unresolved "
+                "items above are retained for inspection."
+            )
+        else:
+            st.write(
+                "Inspect the OCR evidence and correct entries before "
+                "selecting them. `auto` is a deterministic review tier, "
+                "not approval; `check` entries require individual review."
+            )
+            st.warning(
+                "Only the separate confirmation action below marks selected "
+                "records verified and saves them."
+            )
 
-        edited_df = st.data_editor(
-            pd.DataFrame(editable_records),
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            key=f"review_editor_{timetable_id}",
-            column_config={
-                "Approve": st.column_config.CheckboxColumn(
-                    "Approve",
-                    help="Select only after checking this record.",
-                    default=False,
-                ),
-                "day": st.column_config.SelectboxColumn(
-                    "Day",
-                    options=[
-                        "Monday",
-                        "Tuesday",
-                        "Wednesday",
-                        "Thursday",
-                        "Friday",
-                        "Saturday",
-                        "Sunday",
-                    ],
-                ),
-            },
-        )
+            auto_count = sum(
+                record.get("review_tier") == "auto"
+                and record.get("review_status") != "verified"
+                for record in records
+            )
+            revision = st.session_state.get("review_editor_revision", 0)
+            bulk_selection_id = st.session_state.get(
+                "bulk_auto_selected_timetable_id"
+            )
+            bulk_selected = bulk_selection_id == timetable_id
+            bulk_col, clear_col = st.columns(2)
+            with bulk_col:
+                if st.button(
+                    f"Select all auto-tier records ({auto_count})",
+                    disabled=auto_count == 0,
+                    key=f"select_auto_{timetable_id}_{revision}",
+                ):
+                    st.session_state.bulk_auto_selected_timetable_id = (
+                        timetable_id
+                    )
+                    st.session_state.review_editor_revision = revision + 1
+                    st.rerun()
+            with clear_col:
+                if st.button(
+                    "Clear bulk selection",
+                    disabled=not bulk_selected,
+                    key=f"clear_auto_{timetable_id}_{revision}",
+                ):
+                    st.session_state.bulk_auto_selected_timetable_id = None
+                    st.session_state.review_editor_revision = revision + 1
+                    st.rerun()
 
-        st.caption(
-            "Required: day, start_time, end_time, subject, "
-            "teacher_name, class_name and room."
-        )
+            if bulk_selected:
+                st.info(
+                    "Auto-tier records are selected only. They are not "
+                    "approved until you press the separate confirmation button."
+                )
 
-        if st.button("Save Approved Records", type="primary"):
+            def display_teacher_values(teachers):
+                if isinstance(teachers, (str, dict)):
+                    teachers = [teachers]
+                names = []
+                for teacher in teachers or []:
+                    if isinstance(teacher, dict):
+                        name = (
+                            teacher.get("teacher_name")
+                            or teacher.get("name")
+                            or teacher.get("initials")
+                        )
+                    else:
+                        name = teacher
+                    if normalize_missing(name) is not None:
+                        names.append(str(name).strip())
+                return ", ".join(names)
 
-            approved_records = edited_df.to_dict("records")
+            def display_json(value):
+                if value is None:
+                    return ""
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        return value
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
-            selected = [
-                record for record in approved_records
-                if record.get("Approve") is True
-            ]
+            editable_records = []
+            for record in records:
+                class_name = normalize_missing(record.get("class_name"))
+                if class_name is None:
+                    class_name = metadata.get("class_name") or ""
+                auto_default = (
+                    bulk_selected
+                    and record.get("review_tier") == "auto"
+                    and record.get("review_status") != "verified"
+                )
+                editable_records.append({
+                    "Approve": auto_default,
+                    "review_tier": record.get("review_tier", "check"),
+                    "review_status": record.get(
+                        "review_status",
+                        "needs_review",
+                    ),
+                    "resolution_method": record.get(
+                        "resolution_method",
+                        "",
+                    ),
+                    "ocr_confidence": record.get("ocr_confidence"),
+                    "confidence": record.get("confidence"),
+                    "entry_type": record.get("entry_type", "class"),
+                    "day": record.get("day") or "",
+                    "start_time": record.get("start_time") or "",
+                    "end_time": record.get("end_time") or "",
+                    "course": (
+                        record.get("course")
+                        or record.get("subject")
+                        or ""
+                    ),
+                    "course_abbrev": record.get("course_abbrev") or "",
+                    "teacher_name": record.get("teacher_name") or "",
+                    "teachers": display_teacher_values(
+                        record.get("teachers")
+                    ),
+                    "room": record.get("room") or "",
+                    "subgroup": record.get("subgroup") or "",
+                    "class_name": class_name,
+                    "source_document": record.get(
+                        "source_document",
+                        metadata.get("source_document"),
+                    ),
+                    "source_page": record.get("source_page"),
+                    "source_bbox": display_json(
+                        record.get("source_bbox")
+                    ),
+                    "legend_source_bbox": display_json(
+                        record.get("legend_source_bbox")
+                    ),
+                    "original_text": (
+                        record.get("original_text")
+                        or record.get("evidence")
+                        or ""
+                    ),
+                    "unresolved_fields": display_json(
+                        record.get("unresolved_fields")
+                    ),
+                })
 
-            if not selected:
-                st.warning("Select at least one record to approve.")
-
-            else:
-                required_fields = [
-                    "day",
-                    "start_time",
-                    "end_time",
-                    "subject",
-                    "teacher_name",
+            editor_key = (
+                f"review_editor_{timetable_id}_{revision}"
+            )
+            edited_df = st.data_editor(
+                pd.DataFrame(editable_records),
+                width="stretch",
+                hide_index=True,
+                num_rows="fixed",
+                key=editor_key,
+                disabled=[
+                    "review_tier",
+                    "review_status",
+                    "resolution_method",
+                    "entry_type",
+                    "course_abbrev",
+                    "ocr_confidence",
+                    "confidence",
                     "class_name",
-                    "room",
+                    "source_document",
+                    "source_page",
+                    "source_bbox",
+                    "legend_source_bbox",
+                    "original_text",
+                    "unresolved_fields",
+                ],
+                column_config={
+                    "Approve": st.column_config.CheckboxColumn(
+                        "Select for approval",
+                        help=(
+                            "Selection is not approval; use the separate "
+                            "confirmation button after inspection."
+                        ),
+                        default=False,
+                    ),
+                    "day": st.column_config.SelectboxColumn(
+                        "Day",
+                        options=[
+                            "",
+                            "Monday",
+                            "Tuesday",
+                            "Wednesday",
+                            "Thursday",
+                            "Friday",
+                            "Saturday",
+                            "Sunday",
+                        ],
+                    ),
+                    "course": st.column_config.TextColumn("Course"),
+                    "teacher_name": st.column_config.TextColumn(
+                        "Primary teacher"
+                    ),
+                    "teachers": st.column_config.TextColumn(
+                        "Teachers (comma-separated)"
+                    ),
+                    "room": st.column_config.TextColumn(
+                        "Room (optional for activities/breaks)"
+                    ),
+                    "subgroup": st.column_config.TextColumn("Subgroup"),
+                },
+            )
+
+            st.caption(
+                "Editable: course, primary teacher, teachers, room, "
+                "subgroup, day and time. Teacher and room may be blank for "
+                "activities and breaks. Source evidence and provenance are "
+                "read-only."
+            )
+            selected_count = int(
+                edited_df["Approve"].fillna(False).astype(bool).sum()
+            )
+            if selected_count:
+                st.warning(
+                    f"{selected_count} record(s) selected. Review them, then "
+                    "use the separate confirmation action to approve."
+                )
+
+            if st.button(
+                "Confirm approval and save selected records",
+                type="primary",
+                disabled=selected_count == 0,
+                key=f"confirm_save_{timetable_id}_{revision}",
+            ):
+                edited_records = edited_df.to_dict("records")
+                existing_entries = [
+                    entry for entry in get_all_entries()
+                    if entry.get("timetable_id") == timetable_id
                 ]
 
+                def normalized_field(value):
+                    value = normalize_missing(value)
+                    return str(value).strip().casefold() if value is not None else ""
+
+                def normalized_bbox(value):
+                    if isinstance(value, str):
+                        try:
+                            value = json.loads(value)
+                        except json.JSONDecodeError:
+                            pass
+                    if value is None:
+                        return ""
+                    return json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+
+                def duplicate_key(entry):
+                    source_text = (
+                        entry.get("original_text")
+                        or entry.get("evidence")
+                    )
+                    if source_text is None and entry.get("evidence_json"):
+                        try:
+                            source_text = json.loads(entry["evidence_json"])
+                        except (json.JSONDecodeError, TypeError):
+                            source_text = entry.get("evidence_json")
+                    return (
+                        normalized_field(entry.get("timetable_id")),
+                        normalized_field(entry.get("source_page")),
+                        normalized_bbox(entry.get("source_bbox")),
+                        normalized_field(
+                            entry.get("subject") or entry.get("course")
+                        ),
+                        normalized_field(entry.get("subgroup")),
+                        normalized_field(entry.get("parallel_group")),
+                        normalized_field(entry.get("day")),
+                        normalized_field(entry.get("start_time")),
+                        normalized_field(entry.get("end_time")),
+                        normalized_field(source_text),
+                    )
+
+                def unresolved_matches_entry(item, entry):
+                    item_bbox = item.get("source_bbox")
+                    item_evidence = item.get("evidence")
+                    if item_bbox is None and isinstance(item_evidence, dict):
+                        item_bbox = (
+                            item_evidence.get("source_bbox")
+                            or item_evidence.get("bbox")
+                        )
+                    if (
+                        not normalized_bbox(item_bbox)
+                        or normalized_bbox(item_bbox)
+                        != normalized_bbox(entry.get("source_bbox"))
+                    ):
+                        return False
+                    item_text = (
+                        item.get("line")
+                        or item.get("text")
+                        or item.get("original_text")
+                    )
+                    if item_text is None and isinstance(item_evidence, dict):
+                        item_text = (
+                            item_evidence.get("original_text")
+                            or item_evidence.get("text")
+                            or item_evidence.get("line")
+                        )
+                    elif item_text is None:
+                        item_text = item_evidence
+                    item_text = normalized_field(item_text)
+                    record_text = normalized_field(
+                        entry.get("original_text") or entry.get("evidence")
+                    )
+                    return bool(
+                        item_text
+                        and record_text
+                        and (
+                            item_text == record_text
+                            or item_text in record_text
+                            or record_text in item_text
+                        )
+                    )
+
+                existing_keys = {}
+                for existing in existing_entries:
+                    key = duplicate_key(existing)
+                    previous = existing_keys.get(key)
+                    if (
+                        previous is None
+                        or existing.get("review_status") == "verified"
+                    ):
+                        existing_keys[key] = existing
                 saved_count = 0
+                duplicate_count = 0
+                already_approved_count = 0
                 errors = []
                 remaining_records = []
+                reviewed_entries = []
 
-                for index, record in enumerate(approved_records):
+                for index, edited in enumerate(edited_records):
+                    original = dict(records[index])
+                    course = normalize_missing(edited.get("course"))
+                    primary_teacher = normalize_missing(
+                        edited.get("teacher_name")
+                    )
+                    teacher_text = normalize_missing(edited.get("teachers"))
+                    original_teachers = original.get("teachers") or []
+                    original_teacher_text = normalize_missing(
+                        display_teacher_values(original_teachers)
+                    )
+                    teachers_changed = (
+                        normalized_field(teacher_text)
+                        != normalized_field(original_teacher_text)
+                    )
 
-                    # Preserve edited values for rows that remain pending.
-                    if not record.get("Approve"):
-                        pending = dict(records[index])
-                        for field in required_fields:
-                            value = record.get(field)
-                            if pd.isna(value) if value is not None else True:
-                                value = ""
-                            pending[field] = str(value).strip()
-                        pending["original_room_text"] = str(
-                            record.get("original_room_text")
-                            or pending.get("room", "")
+                    if teachers_changed:
+                        teachers = [
+                            {"teacher_name": name.strip()}
+                            for name in str(teacher_text or "").split(",")
+                            if normalize_missing(name) is not None
+                        ]
+                        if (
+                            normalized_field(primary_teacher)
+                            == normalized_field(
+                                original.get("teacher_name")
+                            )
+                            and teachers
+                        ):
+                            primary_teacher = normalize_missing(
+                                teachers[0]["teacher_name"]
+                            )
+                    else:
+                        teachers = original_teachers
+                        if (
+                            normalized_field(primary_teacher)
+                            != normalized_field(
+                                original.get("teacher_name")
+                            )
+                        ):
+                            if isinstance(teachers, (str, dict)):
+                                teachers = [teachers]
+                            teachers = list(teachers or [])
+                            if teachers:
+                                first = teachers[0]
+                                if isinstance(first, dict):
+                                    first = dict(first)
+                                    first["teacher_name"] = primary_teacher
+                                    teachers[0] = first
+                                else:
+                                    teachers[0] = primary_teacher
+                            elif primary_teacher is not None:
+                                teachers = [{
+                                    "teacher_name": primary_teacher,
+                                }]
+
+                    entry = {
+                        **original,
+                        "course": course,
+                        "subject": course,
+                        "course_abbrev": normalize_missing(
+                            edited.get("course_abbrev")
+                        ),
+                        "teacher_name": primary_teacher,
+                        "teachers": teachers,
+                        "room": normalize_missing(edited.get("room")),
+                        "subgroup": normalize_missing(
+                            edited.get("subgroup")
+                        ),
+                        "day": normalize_missing(edited.get("day")),
+                        "start_time": normalize_missing(
+                            edited.get("start_time")
+                        ),
+                        "end_time": normalize_missing(
+                            edited.get("end_time")
+                        ),
+                        "class_name": normalize_missing(
+                            edited.get("class_name")
+                        ),
+                        "source_document": (
+                            normalize_missing(
+                                original.get("source_document")
+                            )
+                            or metadata.get("source_document")
+                        ),
+                        "source_page": original.get("source_page"),
+                        "source_bbox": original.get("source_bbox"),
+                        "original_text": (
+                            original.get("original_text")
+                            or original.get("evidence")
+                        ),
+                        "timetable_id": timetable_id,
+                    }
+                    if normalize_missing(entry.get("class_name")) is None:
+                        entry["class_name"] = normalize_missing(
+                            metadata.get("class_name")
                         )
+                    entry_type = str(
+                        normalize_missing(entry.get("entry_type")) or "class"
+                    ).casefold()
+                    optional_teacher_room = entry_type in {
+                        "activity",
+                        "break",
+                    }
+                    missing = [
+                        field
+                        for field in (
+                            "day",
+                            "start_time",
+                            "end_time",
+                            "course",
+                            "class_name",
+                        )
+                        if normalize_missing(entry.get(field)) is None
+                    ]
+                    if isinstance(teachers, (str, dict)):
+                        teacher_values = [teachers]
+                    else:
+                        teacher_values = teachers or []
+                    has_teacher = normalize_missing(
+                        entry.get("teacher_name")
+                    ) is not None or any(
+                        normalize_missing(
+                            teacher.get("teacher_name")
+                            or teacher.get("name")
+                            or teacher.get("initials")
+                        )
+                        if isinstance(teacher, dict)
+                        else normalize_missing(teacher) is not None
+                        for teacher in teacher_values
+                    )
+                    if not optional_teacher_room and not has_teacher:
+                        missing.append("teacher")
+                    if (
+                        not optional_teacher_room
+                        and normalize_missing(entry.get("room")) is None
+                    ):
+                        missing.append("room")
+
+                    pending = dict(original)
+                    pending.update({
+                        "course": entry.get("course"),
+                        "subject": entry.get("subject"),
+                        "teacher_name": entry.get("teacher_name"),
+                        "teachers": entry.get("teachers"),
+                        "room": entry.get("room"),
+                        "subgroup": entry.get("subgroup"),
+                        "day": entry.get("day"),
+                        "start_time": entry.get("start_time"),
+                        "end_time": entry.get("end_time"),
+                        "class_name": entry.get("class_name"),
+                    })
+                    if not bool(edited.get("Approve")):
                         remaining_records.append(pending)
                         continue
 
-                    cleaned = {}
-
-                    for field in required_fields:
-                        value = record.get(field)
-
-                        if pd.isna(value) if value is not None else True:
-                            value = ""
-
-                        cleaned[field] = str(value).strip()
-
-                    missing = [
-                        field for field in required_fields
-                        if not cleaned[field]
-                        or cleaned[field].upper() == "UNKNOWN"
-                    ]
+                    if normalized_field(
+                        original.get("review_status")
+                    ) == "verified":
+                        already_approved_count += 1
+                        reviewed_entries.append(entry)
+                        continue
 
                     if missing:
                         errors.append(
-                            f"Row {index + 1}: missing or unresolved "
-                            f"fields: {', '.join(missing)}"
+                            f"Row {index + 1}: missing required fields: "
+                            f"{', '.join(missing)}"
                         )
-                        pending = dict(records[index])
-                        pending.update(cleaned)
                         remaining_records.append(pending)
                         continue
 
+                    key = duplicate_key(entry)
+                    duplicate = existing_keys.get(key)
+                    if duplicate is not None:
+                        if duplicate.get("review_status") == "verified":
+                            already_approved_count += 1
+                            reviewed_entries.append(entry)
+                        else:
+                            duplicate_count += 1
+                            remaining_records.append(pending)
+                            errors.append(
+                                f"Row {index + 1}: matching entry already "
+                                "exists and its approval status was preserved."
+                            )
+                        continue
+
+                    entry["review_status"] = "verified"
                     try:
-                        entry = {
-                            **cleaned,
-                            "review_status": "verified",
-                            "source_document": metadata.get(
-                                "source_document"
-                            ),
-                            "source_page": record.get("source_page"),
-                            "semester": metadata.get("semester"),
-                            "section": metadata.get("section"),
-                            "timetable_id": timetable_id,
-                            "original_room_text": str(
-                                record.get("original_room_text")
-                                or cleaned["room"]
-                            ),
-                        }
-
                         insert_entry(entry)
-                        saved_count += 1
-
-                    except Exception as error:
-                        errors.append(
-                            f"Row {index + 1}: {error}"
-                        )
-                        pending = dict(records[index])
-                        pending.update(cleaned)
+                    except (ValueError, TypeError, sqlite3.Error) as error:
+                        errors.append(f"Row {index + 1}: {error}")
                         remaining_records.append(pending)
+                        continue
+
+                    saved_count += 1
+                    existing_keys[key] = entry
+                    reviewed_entries.append(entry)
 
                 st.session_state.review_records = remaining_records
+                remaining_unresolved_items = [
+                    item
+                    for item in unresolved_items
+                    if not any(
+                        unresolved_matches_entry(item, entry)
+                        for entry in reviewed_entries
+                    )
+                ]
+                st.session_state.review_unresolved_items = (
+                    remaining_unresolved_items
+                )
+                st.session_state.bulk_auto_selected_timetable_id = None
+                st.session_state.review_editor_revision = revision + 1
 
                 if saved_count:
                     new_status = (
-                        "ready" if not remaining_records
+                        "ready"
+                        if not remaining_records
+                        and not remaining_unresolved_items
                         else "needs_review"
                     )
-
-                    update_timetable_status(
-                        timetable_id,
-                        new_status,
+                    update_timetable_status(timetable_id, new_status)
+                notices = []
+                if saved_count:
+                    notices.append(
+                        f"Saved {saved_count} explicitly approved record(s) "
+                        "as verified."
                     )
-
-                    st.success(
-                        f"Successfully saved {saved_count} verified records."
+                if already_approved_count:
+                    notices.append(
+                        f"Skipped {already_approved_count} duplicate record(s) "
+                        "that are already verified."
                     )
-
-                if errors:
-                    st.error(
-                        "Some selected records could not be saved:"
+                if duplicate_count:
+                    notices.append(
+                        f"Skipped {duplicate_count} duplicate record(s); "
+                        "existing database approval status was unchanged."
                     )
-                    for error in errors:
-                        st.write(f"- {error}")
+                if (
+                    not remaining_records
+                    and not remaining_unresolved_items
+                    and saved_count
+                ):
+                    notices.append("All extracted records have been reviewed.")
 
-                if not remaining_records:
-                    st.success(
-                        "All extracted records have been reviewed."
-                    )
-
+                st.session_state.review_save_notice = " ".join(notices)
+                st.session_state.review_save_errors = errors
                 st.rerun()

@@ -19,24 +19,40 @@ def find_teacher_schedule(
     """Return a teacher's classes with optional semester/section filters."""
 
     query = """
-        SELECT * FROM timetable_entries
-        WHERE LOWER(teacher_name) = LOWER(?)
-          AND LOWER(day) = LOWER(?)
+        SELECT entry.* FROM timetable_entries AS entry
+        WHERE (
+            LOWER(entry.teacher_name) = LOWER(?)
+            OR EXISTS (
+                SELECT 1
+                FROM entry_teachers AS association
+                WHERE association.entry_id = entry.id
+                  AND (
+                    LOWER(association.teacher_name) = LOWER(?)
+                    OR LOWER(association.initials) = LOWER(?)
+                  )
+            )
+        )
+          AND LOWER(entry.day) = LOWER(?)
     """
-    params = [teacher_name.strip(), day.strip()]
+    if not teacher_name or not str(teacher_name).strip():
+        return []
+    teacher = str(teacher_name).strip()
+    if not teacher:
+        return []
+    params = [teacher, teacher, teacher, day.strip()]
 
     if semester is not None:
-        query += " AND semester = ?"
+        query += " AND entry.semester = ?"
         params.append(semester)
 
     if section is not None:
-        query += " AND LOWER(section) = LOWER(?)"
+        query += " AND LOWER(entry.section) = LOWER(?)"
         params.append(section.strip())
 
     if not include_needs_review:
-        query += " AND review_status = 'verified'"
+        query += " AND entry.review_status = 'verified'"
 
-    query += " ORDER BY start_time"
+    query += " ORDER BY entry.start_time"
 
     with get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
@@ -59,26 +75,37 @@ def find_teacher_at_time(teacher_name, day, time):
 
 
 def find_class_schedule(
-    class_name,
-    day,
+    class_name=None,
+    day=None,
     semester=None,
     section=None,
     include_needs_review=False,
 ):
-    """Return a class schedule with optional semester/section filters."""
+    """Return a class schedule using class name or semester/section."""
+
+    if not day:
+        return {"error": "A day is required."}
+
+    if not class_name and semester is None and not section:
+        return {
+            "error": "Provide a class name or semester/section."
+        }
 
     query = """
         SELECT * FROM timetable_entries
-        WHERE LOWER(class_name) = LOWER(?)
-          AND LOWER(day) = LOWER(?)
+        WHERE LOWER(day) = LOWER(?)
     """
-    params = [class_name.strip(), day.strip()]
+    params = [day.strip()]
+
+    if class_name:
+        query += " AND LOWER(class_name) = LOWER(?)"
+        params.append(class_name.strip())
 
     if semester is not None:
         query += " AND semester = ?"
         params.append(semester)
 
-    if section is not None:
+    if section:
         query += " AND LOWER(section) = LOWER(?)"
         params.append(section.strip())
 
@@ -137,8 +164,34 @@ def detect_conflicts(day=None, include_needs_review=False):
 
     with get_connection() as conn:
         rows = conn.execute(query, params).fetchall()
+        entry_ids = [row["id"] for row in rows]
+        associations = {}
+        for offset in range(0, len(entry_ids), 500):
+            batch = entry_ids[offset:offset + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            association_rows = conn.execute(
+                f"""
+                SELECT entry_id, teacher_name, initials
+                FROM entry_teachers
+                WHERE entry_id IN ({placeholders})
+                """,
+                batch,
+            ).fetchall()
+            for association in association_rows:
+                associations.setdefault(association["entry_id"], set()).update(
+                    _teacher_tokens(
+                        association["teacher_name"],
+                        association["initials"],
+                    )
+                )
 
     entries = [dict(row) for row in rows]
+    teacher_tokens = {
+        entry["id"]: associations.get(entry["id"]) or (
+            _teacher_tokens(entry.get("teacher_name"))
+        )
+        for entry in entries
+    }
     conflicts = []
 
     for i, first in enumerate(entries):
@@ -156,22 +209,42 @@ def detect_conflicts(day=None, include_needs_review=False):
             if not overlaps:
                 continue
 
-            reasons = []
-
-            first_teacher = first["teacher_name"].strip()
-            second_teacher = second["teacher_name"].strip()
+            first_parallel = _identity_value(first.get("parallel_group"))
+            second_parallel = _identity_value(second.get("parallel_group"))
+            if first_parallel and first_parallel == second_parallel:
+                continue
 
             if (
-                first_teacher.casefold() != "unknown"
-                and second_teacher.casefold() != "unknown"
-                and first_teacher.casefold() == second_teacher.casefold()
+                first.get("timetable_id")
+                and second.get("timetable_id")
+                and first.get("timetable_id") != second.get("timetable_id")
+                and _same_event(
+                    first,
+                    second,
+                    teacher_tokens[first["id"]],
+                    teacher_tokens[second["id"]],
+                )
             ):
+                continue
+
+            reasons = []
+
+            if teacher_tokens[first["id"]] & teacher_tokens[second["id"]]:
                 reasons.append("teacher")
 
-            if first["class_name"].casefold() == second["class_name"].casefold():
+            first_class = _identity_value(first.get("class_name"))
+            second_class = _identity_value(second.get("class_name"))
+            if (
+                first_class
+                and first_class == second_class
+                and _identity_value(first.get("subgroup"))
+                == _identity_value(second.get("subgroup"))
+            ):
                 reasons.append("class")
 
-            if first["room"].casefold() == second["room"].casefold():
+            first_room = _identity_value(first.get("room"))
+            second_room = _identity_value(second.get("room"))
+            if first_room and first_room == second_room:
                 reasons.append("room")
 
             if reasons:
@@ -182,6 +255,52 @@ def detect_conflicts(day=None, include_needs_review=False):
                 })
 
     return conflicts
+
+
+def _identity_value(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value or value.casefold() in {"unknown", "none", "null"}:
+        return None
+    return value.casefold()
+
+
+def _teacher_tokens(teacher_name, initials=None):
+    return {
+        token
+        for token in (
+            _identity_value(teacher_name),
+            _identity_value(initials),
+        )
+        if token is not None
+    }
+
+
+def _same_event(first, second, first_teachers, second_teachers):
+    first_course = (
+        _identity_value(first.get("course_abbrev"))
+        or _identity_value(first.get("subject"))
+    )
+    second_course = (
+        _identity_value(second.get("course_abbrev"))
+        or _identity_value(second.get("subject"))
+    )
+    return (
+        _identity_value(first.get("day"))
+        == _identity_value(second.get("day"))
+        and _identity_value(first.get("start_time"))
+        == _identity_value(second.get("start_time"))
+        and _identity_value(first.get("end_time"))
+        == _identity_value(second.get("end_time"))
+        and first_course is not None
+        and first_course == second_course
+        and _identity_value(first.get("subgroup"))
+        == _identity_value(second.get("subgroup"))
+        and _identity_value(first.get("room"))
+        == _identity_value(second.get("room"))
+        and first_teachers == second_teachers
+    )
 
 
 
@@ -385,28 +504,58 @@ def find_common_free_slots(
     if day_start >= day_end:
         raise ValueError("Working start must be earlier than working end")
 
-    column = "teacher_name" if entity_type == "teacher" else "class_name"
     all_intervals = []
 
     for entity in entities:
-        query = f"""
-            SELECT start_time, end_time
-            FROM timetable_entries
-            WHERE LOWER({column}) = LOWER(?)
-              AND LOWER(day) = LOWER(?)
-        """
-        params = [entity.strip(), day.strip()]
+        if entity_type == "teacher":
+            entity_name = entity.strip()
+            if not entity_name:
+                continue
+            query = """
+                SELECT entry.start_time, entry.end_time
+                FROM timetable_entries AS entry
+                WHERE (
+                    LOWER(entry.teacher_name) = LOWER(?)
+                    OR EXISTS (
+                        SELECT 1
+                        FROM entry_teachers AS association
+                        WHERE association.entry_id = entry.id
+                          AND (
+                            LOWER(association.teacher_name) = LOWER(?)
+                            OR LOWER(association.initials) = LOWER(?)
+                          )
+                    )
+                )
+                  AND LOWER(entry.day) = LOWER(?)
+            """
+            params = [entity_name, entity_name, entity_name, day.strip()]
+        else:
+            query = """
+                SELECT start_time, end_time
+                FROM timetable_entries
+                WHERE LOWER(class_name) = LOWER(?)
+                  AND LOWER(day) = LOWER(?)
+            """
+            params = [entity.strip(), day.strip()]
 
         if semester is not None:
-            query += " AND semester = ?"
+            query += " AND entry.semester = ?" if entity_type == "teacher" else " AND semester = ?"
             params.append(semester)
 
         if section is not None:
-            query += " AND LOWER(section) = LOWER(?)"
+            query += (
+                " AND LOWER(entry.section) = LOWER(?)"
+                if entity_type == "teacher"
+                else " AND LOWER(section) = LOWER(?)"
+            )
             params.append(section.strip())
 
         if not include_needs_review:
-            query += " AND review_status = 'verified'"
+            query += (
+                " AND entry.review_status = 'verified'"
+                if entity_type == "teacher"
+                else " AND review_status = 'verified'"
+            )
 
         with get_connection() as conn:
             rows = conn.execute(query, params).fetchall()

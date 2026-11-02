@@ -84,3 +84,13 @@ def test_semester_vii_internship_is_recognized():
 
     assert record["subject"] == "Internship / Project"
     assert record["review_status"] == "needs_review"
+
+
+def test_room_patterns_accept_numbers_not_hardcoded_in_the_parser():
+    cases = (
+        ("OOP CSE LAB 123", "CSE LAB 123"),
+        ("OOP LHC 999", "LHC 999"),
+        ("OOP AB 701 AND AB 702", "AB 701 & AB 702"),
+    )
+    for text, expected_room in cases:
+        assert parse_timetable_cell(make_cell(text))["room"] == expected_room

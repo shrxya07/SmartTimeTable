@@ -82,3 +82,26 @@ ON timetables (semester, section);
 
 CREATE INDEX IF NOT EXISTS idx_timetables_status
 ON timetables (status);
+
+CREATE TABLE IF NOT EXISTS timetable_courses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timetable_id TEXT NOT NULL,
+    course_name TEXT,
+    abbrev TEXT,
+    kind TEXT,
+    section_label TEXT,
+    faculty_name TEXT,
+    faculty_initials TEXT,
+    room TEXT,
+    source_bbox TEXT
+);
+
+CREATE TABLE IF NOT EXISTS entry_teachers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL,
+    teacher_name TEXT NOT NULL,
+    initials TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (entry_id) REFERENCES timetable_entries(id) ON DELETE CASCADE,
+    UNIQUE (entry_id, teacher_name, initials, role)
+);

@@ -9,7 +9,7 @@ from google.genai import types
 from google.genai.errors import APIError
 
 from app.database.db import initialize_database
-from app.database.retrieval import get_all_verified_entries
+from app.database.retrieval import get_verified_teacher_identities
 
 from app.scheduling.engine import (
     find_teacher_schedule,
@@ -28,19 +28,40 @@ from app.scheduling.engine import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
 
-API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
-if not API_KEY:
-    raise ValueError("GEMINI_API_KEY is missing from .env")
-
-client = genai.Client(
-    api_key=API_KEY,
-    http_options=types.HttpOptions(timeout=300000)
+AI_UNAVAILABLE_MESSAGE = (
+    "AI features are disabled because GEMINI_API_KEY is not configured. "
+    "Add it to the .env file and restart the application."
 )
 
-# Initialize the real SQLite database and its schema.
-initialize_database()
+_client = None
+
+
+def _load_api_key():
+    """Return the configured Gemini API key, or None when it is absent."""
+    return (os.getenv("GEMINI_API_KEY") or "").strip() or None
+
+
+def is_ai_available():
+    """Return True when a Gemini API key is configured."""
+    return _load_api_key() is not None
+
+
+def get_client():
+    """Create the Gemini client on first use."""
+    global _client
+
+    if _client is None:
+        api_key = _load_api_key()
+        if api_key is None:
+            raise RuntimeError(AI_UNAVAILABLE_MESSAGE)
+        _client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=60000)
+        )
+
+    return _client
 
 
 # --------------------------------------------------
@@ -68,7 +89,7 @@ def generate_content_with_retry(
                 f"(attempt {attempt}/{max_attempts})..."
             )
 
-            response = client.models.generate_content(
+            response = get_client().models.generate_content(
                 model=MODEL,
                 contents=contents,
                 config=config,
@@ -116,8 +137,8 @@ def gemini_extraction_client(
     Used by the timetable document extraction pipeline.
     """
 
-    if not API_KEY:
-        raise ValueError("GEMINI_API_KEY is not configured.")
+    if not is_ai_available():
+        raise RuntimeError(AI_UNAVAILABLE_MESSAGE)
 
     response = generate_content_with_retry(
         contents=user_prompt,
@@ -141,13 +162,14 @@ def resolve_teacher_name(teacher_name: str):
     if not teacher_name or not teacher_name.strip():
         return {"error": "Please provide a teacher name."}
 
-    entries = get_all_verified_entries()
+    query = teacher_name.strip().casefold()
 
+    # Includes co-teachers from entry_teachers; NULL names are excluded.
     matches = sorted({
-        entry["teacher_name"].strip()
-        for entry in entries
-        if teacher_name.strip().casefold()
-        in entry["teacher_name"].strip().casefold()
+        identity["teacher_name"]
+        for identity in get_verified_teacher_identities()
+        if query in identity["teacher_name"].casefold()
+        or query == identity["initials"].casefold()
     })
 
     if not matches:
@@ -211,24 +233,29 @@ def get_teacher_location(
         time
     )
 
-
 def get_class_timetable(
-    class_name: str,
-    day: str,
+    class_name: str = None,
+    day: str = None,
     semester: int = None,
-    section: str = None
+    section: str = None,
 ):
-    """Get a class timetable for a particular day."""
+    """Get a verified class timetable using available class identifiers."""
 
-    if not class_name or not class_name.strip():
-        return {"error": "Please provide a class name."}
+    if not day:
+        return {"error": "Please provide a day."}
+
+    if not class_name and semester is None and not section:
+        return {
+            "error": "Please provide a class name or semester/section."
+        }
 
     return find_class_schedule(
-        class_name,
-        day,
+        class_name=class_name,
+        day=day,
         semester=semester,
-        section=section
+        section=section,
     )
+    
 
 
 def get_room_schedule(
@@ -325,6 +352,12 @@ IMPORTANT RULES:
 
 Use clear formatting for schedules, including day, time,
 subject, class, teacher and room whenever available.
+14. When the user provides a semester and section, use those
+    values directly with get_class_timetable.
+15. Do not invent or assume a class name such as "Class 3".
+16. If semester and section are known, class_name is optional.
+17. If the user asks about a day, retrieve the matching verified
+    records using the database tool.
 """
 
 
@@ -333,9 +366,12 @@ subject, class, teacher and room whenever available.
 # --------------------------------------------------
 
 def create_chat_session():
-    """Create an independent Gemini chat session."""
+    """Create an independent Gemini chat session, or None without a key."""
 
-    return client.chats.create(
+    if not is_ai_available():
+        return None
+
+    return get_client().chats.create(
         model=MODEL,
         config={
             "system_instruction": SYSTEM_INSTRUCTION,
@@ -345,22 +381,29 @@ def create_chat_session():
     )
 
 
-def ask_timetable_assistant(
-    question: str,
-    chat_session
-) -> str:
-    """Send a question to the persistent Gemini chat session."""
+def ask_timetable_assistant(question: str, chat_session) -> str:
+    """Send a question to Gemini and measure response time."""
 
     if not question or not question.strip():
         return "Please enter a timetable question."
 
+    if chat_session is None:
+        return AI_UNAVAILABLE_MESSAGE
+
+    start = time.perf_counter()
+
     try:
         response = chat_session.send_message(question)
+
+        elapsed = time.perf_counter() - start
+        print(f"Gemini chat response time: {elapsed:.2f} seconds")
 
         return response.text or "I could not generate an answer."
 
     except Exception as error:
-        print("Gemini error:", repr(error))
+        elapsed = time.perf_counter() - start
+
+        print(f"Gemini error after {elapsed:.2f} seconds:", repr(error))
 
         return (
             "Sorry, I encountered an error while checking "
@@ -374,7 +417,11 @@ def ask_timetable_assistant(
 
 if __name__ == "__main__":
 
+    initialize_database()
     chat_session = create_chat_session()
+
+    if chat_session is None:
+        raise SystemExit(AI_UNAVAILABLE_MESSAGE)
 
     print("SmartTimeTable Gemini Assistant")
     print("Type 'exit' to stop.")

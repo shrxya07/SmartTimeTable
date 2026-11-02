@@ -3,25 +3,60 @@
 
 from app.ingestion.extraction_pipeline import run_extraction_pipeline
 from app.ingestion.importer import import_timetable_records
+from app.database.db import normalize_missing
 
 
 REQUIRED_FIELDS = (
     "day",
     "start_time",
     "end_time",
-    "subject",
-    "teacher_name",
-    "room",
 )
 
 
-def validate_import_record(record):
+def validate_import_record(
+    record,
+    semester=None,
+    section=None,
+    default_room=None,
+):
     """Return missing required fields for a proposed database record."""
-    return [
+    missing = [
         field
         for field in REQUIRED_FIELDS
-        if not str(record.get(field, "")).strip()
+        if normalize_missing(record.get(field)) is None
     ]
+    if (
+        normalize_missing(record.get("subject")) is None
+        and normalize_missing(record.get("course")) is None
+    ):
+        missing.append("subject")
+    entry_type = str(
+        normalize_missing(record.get("entry_type")) or "class"
+    ).casefold()
+    if entry_type not in {"activity", "break"}:
+        teacher_name = normalize_missing(record.get("teacher_name"))
+        teachers = record.get("teachers") or []
+        if isinstance(teachers, (str, dict)):
+            teachers = [teachers]
+        has_teacher = teacher_name is not None or any(
+            normalize_missing(
+                teacher.get("teacher_name")
+                or teacher.get("name")
+                or teacher.get("initials")
+            )
+            if isinstance(teacher, dict)
+            else normalize_missing(teacher) is not None
+            for teacher in teachers
+        )
+        if not has_teacher:
+            missing.append("teacher_name")
+        if (
+            normalize_missing(record.get("room")) is None
+            and normalize_missing(default_room) is None
+        ):
+            missing.append("room")
+
+    return missing
 
 
 def run_import_pipeline(
@@ -66,7 +101,12 @@ def run_import_pipeline(
             invalid_indices.append(index)
             continue
 
-        missing = validate_import_record(record)
+        missing = validate_import_record(
+            record,
+            semester=semester,
+            section=section,
+            default_room=default_room,
+        )
         if missing:
             invalid_indices.append({
                 "index": index,
@@ -123,7 +163,7 @@ def run_import_pipeline(
     )
 
     return {
-        "status": "import_completed",
+        "status": "import_completed" if imported_count else "nothing_imported",
         "timetable_id": timetable_id,
         "extracted_count": len(records),
         "approved_count": len(approved_records),
@@ -132,4 +172,14 @@ def run_import_pipeline(
         "invalid_records": invalid_indices,
         "invalid_approval_indices": invalid_approval_indices,
         "import_results": import_results,
+        **(
+            {}
+            if imported_count
+            else {
+                "message": (
+                    "No records were imported. Existing timetable data "
+                    "was left unchanged."
+                )
+            }
+        ),
     }

@@ -56,11 +56,11 @@ TEACHERS = {
 }
 
 ROOM_PATTERNS = [
-    (r"\bCSE\s*LAB\s*1\b", "CSE LAB 1"),
-    (r"\bCSE\s*LAB\s*2\b", "CSE LAB 2"),
-    (r"\bLHC\s*305\b", "LHC 305"),
-    (r"\bAB\s*701\s*(?:&|AND)\s*AB\s*702\b", "AB 701 & AB 702"),
-    (r"\bAB\s*702\s*701\b", "AB 701 & AB 702"),
+    re.compile(
+        r"\b(?:CSE\s*LAB\s*\d+|LHC\s*\d+|"
+        r"AB\s*\d+\s*(?:&|AND)\s*AB\s*\d+)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 
@@ -117,9 +117,17 @@ def parse_timetable_cell(
     room = default_room
     room_source = "header_default" if default_room else "unresolved"
 
-    for pattern, room_name in ROOM_PATTERNS:
-        if re.search(pattern, upper):
-            room = room_name
+    for pattern in ROOM_PATTERNS:
+        room_match = pattern.search(upper)
+        if room_match:
+            room = re.sub(r"\s+", " ", room_match.group(0)).upper()
+            room = re.sub(r"\bCSE\s*LAB\s*(\d+)\b", r"CSE LAB \1", room)
+            room = re.sub(r"\bLHC\s*(\d+)\b", r"LHC \1", room)
+            room = re.sub(
+                r"\bAB\s*(\d+)\s*(?:&|AND)\s*AB\s*(\d+)\b",
+                r"AB \1 & AB \2",
+                room,
+            )
             room_source = "cell"
             break
 
