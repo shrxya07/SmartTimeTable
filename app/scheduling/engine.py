@@ -118,20 +118,21 @@ def find_class_schedule(
         rows = conn.execute(query, params).fetchall()
 
     return [dict(row) for row in rows]
-def find_room_at_time(room, day, time):
+def find_room_at_time(room, day, time, include_needs_review=False):
     """Find which class uses a room at a particular time."""
     target = _to_minutes(time)
 
+    query = """
+        SELECT * FROM timetable_entries
+        WHERE LOWER(room) = LOWER(?)
+          AND LOWER(day) = LOWER(?)
+    """
+    if not include_needs_review:
+        query += " AND review_status = 'verified'"
+    query += " ORDER BY start_time"
+
     with get_connection() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM timetable_entries
-            WHERE LOWER(room) = LOWER(?)
-              AND LOWER(day) = LOWER(?)
-            ORDER BY start_time
-            """,
-            (room.strip(), day.strip()),
-        ).fetchall()
+        rows = conn.execute(query, (room.strip(), day.strip())).fetchall()
 
     return [
         dict(row) for row in rows

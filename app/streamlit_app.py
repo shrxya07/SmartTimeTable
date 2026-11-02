@@ -17,16 +17,24 @@ from app.genai_assistant import (
     AI_UNAVAILABLE_MESSAGE,
     create_chat_session,
     ask_timetable_assistant,
-    gemini_extraction_client,
+    gemini_vision_client,
     is_ai_available,
+    list_known_timetable_data,
 )
 from app.ingestion.extraction_pipeline import run_extraction_pipeline
+from app.ingestion.timetable_validator import class_name_for
+from app.ingestion.vision_extractor import SUPPORTED_SUFFIXES
 from app.database.db import (
     get_all_entries,
+    get_pending_reviews,
     initialize_database,
+    insert_course_offerings,
     insert_entry,
     normalize_missing,
+    normalize_time,
     register_timetable,
+    save_pending_review,
+    update_timetable_metadata,
     update_timetable_status,
 )
 from app.database.retrieval import get_all_verified_entries
@@ -124,12 +132,27 @@ if page == "Chat Assistant":
     if not AI_AVAILABLE:
         st.warning(AI_UNAVAILABLE_MESSAGE)
 
+    try:
+        known = list_known_timetable_data()
+    except sqlite3.Error:
+        known = {"teachers": [], "rooms": [], "classes": []}
+
+    if not known["teachers"] and not known["classes"]:
+        st.info(
+            "No approved timetable data yet. Upload a timetable and approve "
+            "its records first."
+        )
+
+    # Example questions use names that exist in the approved data.
+    example_teacher = (known["teachers"] or ["the teacher"])[0]
+    example_room = (known["rooms"] or ["the room"])[0]
+    example_class = (known["classes"] or ["3A"])[0]
     examples = [
-        "Show Dr. Rao's timetable on Monday",
-        "Where is Dr. Rao on Monday at 10:30 AM?",
-        "When is Dr. Rao free on Monday?",
-        "Which class is using LHC 301 on Monday at 11 AM?",
-        "Show the timetable for CSE 3A on Monday",
+        f"Show {example_teacher}'s timetable on Monday",
+        f"Where is {example_teacher} on Tuesday at 10:00?",
+        f"When is {example_teacher} free on Wednesday?",
+        f"Which class is using {example_room} on Monday at 11:00?",
+        f"When is class {example_class} free on Thursday?",
     ]
 
     st.markdown("### Try asking")
@@ -197,32 +220,30 @@ elif page == "Upload Timetable":
     )
 
     if not AI_AVAILABLE:
-        st.info(
-            "Gemini fallback is disabled because GEMINI_API_KEY is not "
-            "configured. Deterministic OCR extraction still runs."
+        st.warning(
+            "Timetable extraction uses Gemini and is disabled because "
+            "GEMINI_API_KEY is not configured."
         )
 
     uploaded_file = st.file_uploader(
         "Choose a timetable image or PDF",
-        type=["png", "jpg", "jpeg", "pdf"],
+        type=[suffix.lstrip(".") for suffix in SUPPORTED_SUFFIXES],
     )
 
     col1, col2 = st.columns(2)
 
     with col1:
-        # Current project timetable: Semester 7, Section C.
-        # Change these defaults when uploading a different class timetable.
         semester_value = st.selectbox(
             "Semester",
-            list(range(1, 9)),
-            index=6,
+            ["Auto-detect", *range(1, 9)],
+            help="Leave on Auto-detect to read it from the timetable.",
         )
 
     with col2:
         section_value = st.text_input(
             "Section",
-            value="C",
-            placeholder="Example: A",
+            value="",
+            placeholder="Auto-detect",
         )
 
     if uploaded_file is not None:
@@ -235,7 +256,11 @@ elif page == "Upload Timetable":
                 use_container_width=True,
             )
 
-        if st.button("Extract Timetable", type="primary"):
+        if st.button(
+            "Extract Timetable",
+            type="primary",
+            disabled=not AI_AVAILABLE,
+        ):
 
             UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -245,14 +270,12 @@ elif page == "Upload Timetable":
             stored_filename = f"{timetable_id}_{safe_filename}"
             stored_path = UPLOADS_DIR / stored_filename
 
-            semester = int(semester_value)
+            semester = (
+                None if semester_value == "Auto-detect" else int(semester_value)
+            )
             section = section_value.strip().upper() or None
 
-            class_name = (
-                f"{semester}{section}"
-                if section
-                else None
-            )
+            class_name = class_name_for(semester, section)
 
             metadata = {
                 "source_document": uploaded_file.name,
@@ -274,16 +297,29 @@ elif page == "Upload Timetable":
                 )
 
                 with st.spinner(
-                    "Running OCR and Gemini extraction. Please wait..."
+                    "Reading the timetable with Gemini. This usually takes "
+                    "30-90 seconds per page..."
                 ):
                     result = run_extraction_pipeline(
                         image_path=stored_path,
-                        llm_client=(
-                            gemini_extraction_client
-                            if AI_AVAILABLE
-                            else None
-                        ),
+                        vision_client=gemini_vision_client,
                         metadata=metadata,
+                    )
+
+                header = result.get("header") or {}
+                semester = semester or header.get("semester")
+                section = section or header.get("section")
+                class_name = class_name or header.get("class_name")
+                metadata.update({
+                    "semester": semester,
+                    "section": section,
+                    "class_name": class_name,
+                })
+                update_timetable_metadata(timetable_id, semester, section)
+                if result.get("course_offerings"):
+                    insert_course_offerings(
+                        timetable_id,
+                        result["course_offerings"],
                     )
 
                 records = result.get("records", [])
@@ -304,16 +340,14 @@ elif page == "Upload Timetable":
                     ) is None:
                         record["source_document"] = uploaded_file.name
 
-                with st.expander("Debug: OCR text detected"):
-                    st.text(
-                        result.get("ocr_evidence", {}).get(
-                            "text",
-                            "No OCR text",
-                        )
-                    )
+                with st.expander("Detected timetable details"):
+                    st.json(header)
 
-                with st.expander("Debug: Extraction metadata"):
-                    st.json(metadata)
+                if result.get("legend"):
+                    with st.expander(
+                        f"Course table ({len(result['legend'])} courses)"
+                    ):
+                        st.json(result["legend"])
 
                 if result.get("document_uncertainties"):
                     with st.expander("Extraction uncertainties"):
@@ -338,6 +372,12 @@ elif page == "Upload Timetable":
                 )
                 st.session_state.bulk_auto_selected_timetable_id = None
 
+                save_pending_review(timetable_id, {
+                    "records": records,
+                    "unresolved_items": unresolved_items,
+                    "metadata": metadata,
+                    "message": result.get("message"),
+                })
                 update_timetable_status(
                     timetable_id,
                     "needs_review",
@@ -346,7 +386,8 @@ elif page == "Upload Timetable":
                 if records:
                     st.success(
                         f"Extraction completed. Found {len(records)} "
-                        "reviewable records; none are approved yet."
+                        f"records ({result.get('auto_count', 0)} passed all "
+                        "checks); none are approved yet."
                     )
                 else:
                     st.warning(
@@ -378,6 +419,54 @@ elif page == "Upload Timetable":
 elif page == "Review Extracted Records":
 
     st.title("Review Extracted Records")
+
+    def load_pending_review(item):
+        payload = item["payload"]
+        st.session_state.current_timetable_id = item["timetable_id"]
+        st.session_state.current_timetable_metadata = (
+            payload.get("metadata") or {}
+        )
+        st.session_state.review_records = payload.get("records") or []
+        st.session_state.review_unresolved_items = (
+            payload.get("unresolved_items") or []
+        )
+        st.session_state.review_extraction_result = {
+            "message": payload.get("message"),
+        }
+        st.session_state.review_save_errors = []
+        st.session_state.review_save_notice = ""
+        st.session_state.review_editor_revision = (
+            st.session_state.get("review_editor_revision", 0) + 1
+        )
+        st.session_state.bulk_auto_selected_timetable_id = None
+
+    # Reviews are stored in the database so they survive a restart.
+    try:
+        pending_reviews = get_pending_reviews()
+    except sqlite3.Error:
+        pending_reviews = []
+    pending_by_id = {item["timetable_id"]: item for item in pending_reviews}
+
+    if pending_by_id:
+        current_id = st.session_state.current_timetable_id
+        if current_id is None:
+            load_pending_review(pending_reviews[0])
+            current_id = st.session_state.current_timetable_id
+        options = list(pending_by_id)
+        selected_id = st.selectbox(
+            "Timetable awaiting review",
+            options,
+            index=options.index(current_id) if current_id in options else None,
+            format_func=lambda timetable_id: (
+                f"{pending_by_id[timetable_id]['original_filename'] or timetable_id}"
+                f" - {len(pending_by_id[timetable_id]['payload'].get('records') or [])}"
+                " records left"
+            ),
+            placeholder="Choose a timetable",
+        )
+        if selected_id is not None and selected_id != current_id:
+            load_pending_review(pending_by_id[selected_id])
+            st.rerun()
 
     records = st.session_state.review_records
     timetable_id = st.session_state.current_timetable_id
@@ -551,6 +640,16 @@ elif page == "Review Extracted Records":
                     "unresolved_fields": display_json(
                         record.get("unresolved_fields")
                     ),
+                    "issues": "; ".join(
+                        [
+                            str(reason)
+                            for reason in (
+                                record.get("unresolved_fields") or {}
+                            ).values()
+                            if isinstance(reason, str)
+                        ]
+                        + list(record.get("uncertainties") or [])
+                    ),
                 })
 
             editor_key = (
@@ -570,13 +669,20 @@ elif page == "Review Extracted Records":
                     "course_abbrev",
                     "ocr_confidence",
                     "confidence",
-                    "class_name",
                     "source_document",
                     "source_page",
                     "source_bbox",
                     "legend_source_bbox",
                     "original_text",
                     "unresolved_fields",
+                    "issues",
+                ],
+                column_order=[
+                    "Approve", "review_tier", "issues", "entry_type", "day",
+                    "start_time", "end_time", "course", "course_abbrev",
+                    "teacher_name", "teachers", "room", "subgroup",
+                    "class_name", "original_text", "source_document",
+                    "source_page", "resolution_method",
                 ],
                 column_config={
                     "Approve": st.column_config.CheckboxColumn(
@@ -611,12 +717,17 @@ elif page == "Review Extracted Records":
                         "Room (optional for activities/breaks)"
                     ),
                     "subgroup": st.column_config.TextColumn("Subgroup"),
+                    "class_name": st.column_config.TextColumn("Class"),
+                    "issues": st.column_config.TextColumn(
+                        "Issues",
+                        help="Why a record needs checking ('check' tier).",
+                    ),
                 },
             )
 
             st.caption(
                 "Editable: course, primary teacher, teachers, room, "
-                "subgroup, day and time. Teacher and room may be blank for "
+                "subgroup, class, day and time. Teacher and room may be blank for "
                 "activities and breaks. Source evidence and provenance are "
                 "read-only."
             )
@@ -640,6 +751,14 @@ elif page == "Review Extracted Records":
                     entry for entry in get_all_entries()
                     if entry.get("timetable_id") == timetable_id
                 ]
+
+                def padded_time(value):
+                    # "9:00" -> "09:00" so duplicate checks match saved rows;
+                    # invalid text is left for insert_entry to report.
+                    try:
+                        return normalize_time(value)
+                    except ValueError:
+                        return normalize_missing(value)
 
                 def normalized_field(value):
                     value = normalize_missing(value)
@@ -811,12 +930,8 @@ elif page == "Review Extracted Records":
                             edited.get("subgroup")
                         ),
                         "day": normalize_missing(edited.get("day")),
-                        "start_time": normalize_missing(
-                            edited.get("start_time")
-                        ),
-                        "end_time": normalize_missing(
-                            edited.get("end_time")
-                        ),
+                        "start_time": padded_time(edited.get("start_time")),
+                        "end_time": padded_time(edited.get("end_time")),
                         "class_name": normalize_missing(
                             edited.get("class_name")
                         ),
@@ -953,6 +1068,12 @@ elif page == "Review Extracted Records":
                 )
                 st.session_state.bulk_auto_selected_timetable_id = None
                 st.session_state.review_editor_revision = revision + 1
+                save_pending_review(timetable_id, {
+                    "records": remaining_records,
+                    "unresolved_items": remaining_unresolved_items,
+                    "metadata": metadata,
+                    "message": extraction_result.get("message"),
+                })
 
                 if saved_count:
                     new_status = (

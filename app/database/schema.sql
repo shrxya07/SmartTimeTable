@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS timetable_entries (
     source_document TEXT,
     source_page INTEGER,
 
-    review_status TEXT NOT NULL DEFAULT 'verified',
+    review_status TEXT NOT NULL DEFAULT 'needs_review',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CHECK (semester IN (1, 2, 3, 4, 5, 6, 7, 8)),
@@ -94,6 +94,13 @@ CREATE TABLE IF NOT EXISTS timetable_courses (
     faculty_initials TEXT,
     room TEXT,
     source_bbox TEXT
+);
+
+-- Extracted records awaiting review, kept so a restart does not lose them.
+CREATE TABLE IF NOT EXISTS pending_reviews (
+    timetable_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS entry_teachers (

@@ -80,6 +80,8 @@ def make_review_app(
         "update_timetable_status",
         lambda *args: status_updates.append(args),
     )
+    monkeypatch.setattr(database, "get_pending_reviews", lambda: [])
+    monkeypatch.setattr(database, "save_pending_review", lambda *args: None)
 
     original_editor = st.data_editor
 

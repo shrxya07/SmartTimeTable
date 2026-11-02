@@ -1,5 +1,7 @@
 
 import os
+import re
+import threading
 import time
 from pathlib import Path
 
@@ -9,7 +11,12 @@ from google.genai import types
 from google.genai.errors import APIError
 
 from app.database.db import initialize_database
-from app.database.retrieval import get_verified_teacher_identities
+from app.database.retrieval import (
+    get_verified_classes,
+    get_verified_rooms,
+    get_verified_teacher_identities,
+)
+from app.ingestion.timetable_validator import normalize_clock, normalize_day
 
 from app.scheduling.engine import (
     find_teacher_schedule,
@@ -17,6 +24,8 @@ from app.scheduling.engine import (
     find_class_schedule,
     find_room_at_time,
     find_free_slots,
+    find_room_free_slots,
+    find_section_free_slots,
     detect_conflicts,
 )
 
@@ -29,6 +38,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+# Extraction needs the stronger model: flash-lite mis-read merged cells.
+VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash")
 
 AI_UNAVAILABLE_MESSAGE = (
     "AI features are disabled because GEMINI_API_KEY is not configured. "
@@ -36,6 +47,8 @@ AI_UNAVAILABLE_MESSAGE = (
 )
 
 _client = None
+# Streamlit sessions and PDF pages run on threads; build exactly one client.
+_client_lock = threading.Lock()
 
 
 def _load_api_key():
@@ -52,14 +65,16 @@ def get_client():
     """Create the Gemini client on first use."""
     global _client
 
-    if _client is None:
-        api_key = _load_api_key()
-        if api_key is None:
-            raise RuntimeError(AI_UNAVAILABLE_MESSAGE)
-        _client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(timeout=60000)
-        )
+    with _client_lock:
+        if _client is None:
+            api_key = _load_api_key()
+            if api_key is None:
+                raise RuntimeError(AI_UNAVAILABLE_MESSAGE)
+            # Vision extraction of a dense page can take ~90 s.
+            _client = genai.Client(
+                api_key=api_key,
+                http_options=types.HttpOptions(timeout=180000)
+            )
 
     return _client
 
@@ -71,7 +86,8 @@ def get_client():
 def generate_content_with_retry(
     contents,
     config,
-    max_attempts=3
+    max_attempts=3,
+    model=None,
 ):
     """
     Call Gemini and retry temporary API failures.
@@ -90,7 +106,7 @@ def generate_content_with_retry(
             )
 
             response = get_client().models.generate_content(
-                model=MODEL,
+                model=model or MODEL,
                 contents=contents,
                 config=config,
             )
@@ -124,29 +140,35 @@ def generate_content_with_retry(
 
 
 # --------------------------------------------------
-# 3. Gemini extraction adapter
+# 3. Gemini vision extraction adapter
 # --------------------------------------------------
 
-def gemini_extraction_client(
-    system_prompt: str,
-    user_prompt: str
+def gemini_vision_client(
+    image_bytes: bytes,
+    mime_type: str,
+    prompt: str,
+    response_schema,
 ):
     """
-    Send OCR evidence to Gemini and return structured JSON.
+    Send one timetable page image to Gemini and return structured JSON.
 
-    Used by the timetable document extraction pipeline.
+    Used by the timetable extraction pipeline.
     """
 
     if not is_ai_available():
         raise RuntimeError(AI_UNAVAILABLE_MESSAGE)
 
     response = generate_content_with_retry(
-        contents=user_prompt,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            prompt,
+        ],
         config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.1,
+            temperature=0,
             response_mime_type="application/json",
+            response_schema=response_schema,
         ),
+        model=VISION_MODEL,
     )
 
     return response.text
@@ -156,20 +178,41 @@ def gemini_extraction_client(
 # 4. Helper functions
 # --------------------------------------------------
 
+_TITLES = re.compile(r"\b(dr|prof|professor|mr|mrs|ms|miss|sir|madam)\b\.?", re.I)
+
+
+def _name_key(value):
+    """Compare names ignoring titles, case, spaces and punctuation."""
+    without_titles = _TITLES.sub(" ", str(value or ""))
+    return re.sub(r"[^a-z0-9]", "", without_titles.casefold())
+
+
+def _compact(value):
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
 def resolve_teacher_name(teacher_name: str):
-    """Resolve a teacher name against verified database records."""
+    """Resolve a teacher name or initials against verified database records."""
 
     if not teacher_name or not teacher_name.strip():
         return {"error": "Please provide a teacher name."}
 
-    query = teacher_name.strip().casefold()
+    query = _name_key(teacher_name)
+    if not query:
+        return {"error": "Please provide a teacher name."}
 
     # Includes co-teachers from entry_teachers; NULL names are excluded.
-    matches = sorted({
+    identities = get_verified_teacher_identities()
+    exact = sorted({
         identity["teacher_name"]
-        for identity in get_verified_teacher_identities()
-        if query in identity["teacher_name"].casefold()
-        or query == identity["initials"].casefold()
+        for identity in identities
+        if query == _name_key(identity["teacher_name"])
+        or query == _compact(identity["initials"])
+    })
+    matches = exact or sorted({
+        identity["teacher_name"]
+        for identity in identities
+        if query in _name_key(identity["teacher_name"])
     })
 
     if not matches:
@@ -190,6 +233,71 @@ def resolve_teacher_name(teacher_name: str):
     return {"teacher_name": matches[0]}
 
 
+def resolve_room(room: str):
+    """Match 'lhc301' or 'LHC-301' to the stored room name 'LHC 301'."""
+    if not room or not room.strip():
+        return {"error": "Please provide a room name."}
+    query = _compact(room)
+    rooms = get_verified_rooms()
+    matches = [name for name in rooms if _compact(name) == query] or [
+        name for name in rooms if query in _compact(name)
+    ]
+    if not matches:
+        return {"error": f"No verified timetable records use room {room}."}
+    if len(matches) > 1:
+        return {
+            "error": "Multiple rooms match your query.",
+            "matching_rooms": matches,
+            "instruction": "Ask the user to specify the room.",
+        }
+    return {"room": matches[0]}
+
+
+def resolve_class(class_name=None, semester=None, section=None):
+    """Turn 'CSE 3A', '3A', 'Semester 3 Section A' into a stored class name."""
+    classes = get_verified_classes()
+    if class_name:
+        query = _compact(class_name)
+        for item in classes:
+            if _compact(item["class_name"]) == query:
+                return {"class_name": item["class_name"]}
+        match = re.search(
+            r"(\d)\s*(?:sec(?:tion)?)?\s*([a-z])\s*$",
+            class_name.strip(),
+            re.I,
+        )
+        if match:
+            semester = int(match.group(1))
+            section = match.group(2).upper()
+    if semester is not None and section:
+        for item in classes:
+            if item["semester"] == int(semester) and str(
+                item["section"] or ""
+            ).upper() == str(section).upper():
+                return {"class_name": item["class_name"]}
+    if class_name or (semester is not None and section):
+        return {
+            "error": "No verified timetable found for that class.",
+            "known_classes": [item["class_name"] for item in classes],
+        }
+    return {"error": "Please provide a class name or semester and section."}
+
+
+def _check_day_time(day, time_value=None):
+    """Normalize 'mon'/'MONDAY' and '2:40 PM'/'14.40'; report unreadable input."""
+    normalized_day = normalize_day(day)
+    if normalized_day is None:
+        return None, None, {"error": f"Could not understand the day '{day}'."}
+    if time_value is None:
+        return normalized_day, None, None
+    normalized_time, _ = normalize_clock(time_value)
+    if normalized_time is None:
+        return normalized_day, None, {
+            "error": f"Could not understand the time '{time_value}'. Use e.g. 10:30."
+        }
+    return normalized_day, normalized_time, None
+
+
 # --------------------------------------------------
 # 5. Real database-backed Gemini tools
 # --------------------------------------------------
@@ -203,9 +311,11 @@ def get_teacher_schedule(
     """Get a teacher's verified timetable for a day."""
 
     resolved = resolve_teacher_name(teacher_name)
-
     if "error" in resolved:
         return resolved
+    day, _, error = _check_day_time(day)
+    if error:
+        return error
 
     return find_teacher_schedule(
         resolved["teacher_name"],
@@ -220,12 +330,14 @@ def get_teacher_location(
     day: str,
     time: str
 ):
-    """Find a teacher's scheduled class at a particular time."""
+    """Find a teacher's scheduled class at a particular time (e.g. 10:30)."""
 
     resolved = resolve_teacher_name(teacher_name)
-
     if "error" in resolved:
         return resolved
+    day, time, error = _check_day_time(day, time)
+    if error:
+        return error
 
     return find_teacher_at_time(
         resolved["teacher_name"],
@@ -233,29 +345,49 @@ def get_teacher_location(
         time
     )
 
+
 def get_class_timetable(
     class_name: str = None,
     day: str = None,
     semester: int = None,
     section: str = None,
 ):
-    """Get a verified class timetable using available class identifiers."""
+    """Get a verified class timetable for a day, using a class name such as
+    '3A' or a semester and section."""
 
     if not day:
         return {"error": "Please provide a day."}
+    day, _, error = _check_day_time(day)
+    if error:
+        return error
+    resolved = resolve_class(class_name, semester, section)
+    if "error" in resolved:
+        return resolved
 
-    if not class_name and semester is None and not section:
-        return {
-            "error": "Please provide a class name or semester/section."
-        }
+    return find_class_schedule(class_name=resolved["class_name"], day=day)
 
-    return find_class_schedule(
-        class_name=class_name,
-        day=day,
-        semester=semester,
-        section=section,
+
+def get_class_free_slots(
+    day: str,
+    class_name: str = None,
+    semester: int = None,
+    section: str = None,
+    min_duration_minutes: int = 50,
+):
+    """Find periods when a class has nothing scheduled in verified records."""
+
+    day, _, error = _check_day_time(day)
+    if error:
+        return error
+    resolved = resolve_class(class_name, semester, section)
+    if "error" in resolved:
+        return resolved
+
+    return find_section_free_slots(
+        resolved["class_name"],
+        day,
+        min_duration_minutes=min_duration_minutes,
     )
-    
 
 
 def get_room_schedule(
@@ -263,12 +395,37 @@ def get_room_schedule(
     day: str,
     time: str
 ):
-    """Find which class is using a room at a particular time."""
+    """Find which class is using a room at a particular time (e.g. 11:00)."""
 
-    if not room or not room.strip():
-        return {"error": "Please provide a room name."}
+    resolved = resolve_room(room)
+    if "error" in resolved:
+        return resolved
+    day, time, error = _check_day_time(day, time)
+    if error:
+        return error
 
-    return find_room_at_time(room, day, time)
+    return find_room_at_time(resolved["room"], day, time)
+
+
+def get_room_free_slots(
+    room: str,
+    day: str,
+    min_duration_minutes: int = 50,
+):
+    """Find periods when a room is not used in verified records."""
+
+    resolved = resolve_room(room)
+    if "error" in resolved:
+        return resolved
+    day, _, error = _check_day_time(day)
+    if error:
+        return error
+
+    return find_room_free_slots(
+        resolved["room"],
+        day,
+        min_duration_minutes=min_duration_minutes,
+    )
 
 
 def get_teacher_free_slots(
@@ -281,9 +438,11 @@ def get_teacher_free_slots(
     """Find verified free periods in a teacher's schedule."""
 
     resolved = resolve_teacher_name(teacher_name)
-
     if "error" in resolved:
         return resolved
+    day, _, error = _check_day_time(day)
+    if error:
+        return error
 
     return find_free_slots(
         resolved["teacher_name"],
@@ -297,7 +456,24 @@ def get_teacher_free_slots(
 def get_timetable_conflicts(day: str = None):
     """Detect conflicts in verified timetable records."""
 
+    if day:
+        day, _, error = _check_day_time(day)
+        if error:
+            return error
     return detect_conflicts(day=day)
+
+
+def list_known_timetable_data():
+    """List the teachers, rooms and classes that have verified records."""
+
+    return {
+        "teachers": sorted({
+            identity["teacher_name"]
+            for identity in get_verified_teacher_identities()
+        }),
+        "rooms": get_verified_rooms(),
+        "classes": [item["class_name"] for item in get_verified_classes()],
+    }
 
 
 # --------------------------------------------------
@@ -308,9 +484,12 @@ TOOLS = [
     get_teacher_schedule,
     get_teacher_location,
     get_class_timetable,
+    get_class_free_slots,
     get_room_schedule,
+    get_room_free_slots,
     get_teacher_free_slots,
     get_timetable_conflicts,
+    list_known_timetable_data,
 ]
 
 
@@ -325,8 +504,8 @@ You answer questions about:
 - Teacher schedules
 - Teacher's scheduled classroom at a particular time
 - Class timetables
-- Room occupancy
-- Teacher free periods
+- Room occupancy and free rooms
+- Teacher and class free periods
 - Timetable conflicts
 
 IMPORTANT RULES:
@@ -358,6 +537,13 @@ subject, class, teacher and room whenever available.
 16. If semester and section are known, class_name is optional.
 17. If the user asks about a day, retrieve the matching verified
     records using the database tool.
+18. Pass names, rooms and classes as the user wrote them; the tools
+    match "Dr. Rao", "rao" or initials, "lhc301", and "CSE 3A".
+19. If a name, room or class is not found, call
+    list_known_timetable_data and suggest the closest known values.
+20. If the user gives no day for a day-based question, ask which day.
+21. Entries with a subgroup (e.g. "Section 2", "S1") apply only to
+    that group of students; say so when you list them.
 """
 
 

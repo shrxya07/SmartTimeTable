@@ -513,6 +513,69 @@ def update_timetable_status(timetable_id, status):
             raise ValueError(f"Timetable not found: {timetable_id}")
 
 
+def update_timetable_metadata(timetable_id, semester=None, section=None):
+    """Fill in semester/section detected after upload (never overwrites)."""
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE timetables
+            SET semester = COALESCE(semester, ?),
+                section = COALESCE(section, ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE timetable_id = ?
+            """,
+            (semester, section, timetable_id),
+        )
+
+
+def save_pending_review(timetable_id, payload):
+    """Store records awaiting review; an empty payload removes the entry."""
+    with get_connection() as connection:
+        if not payload or (
+            not payload.get("records") and not payload.get("unresolved_items")
+        ):
+            connection.execute(
+                "DELETE FROM pending_reviews WHERE timetable_id = ?",
+                (timetable_id,),
+            )
+            return
+        connection.execute(
+            """
+            INSERT INTO pending_reviews (timetable_id, payload_json)
+            VALUES (?, ?)
+            ON CONFLICT (timetable_id) DO UPDATE SET
+                payload_json = excluded.payload_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (timetable_id, json.dumps(payload, ensure_ascii=False, default=str)),
+        )
+
+
+def get_pending_reviews():
+    """Return pending reviews, newest first, with their timetable details."""
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT pending.timetable_id, pending.payload_json,
+                   pending.updated_at, timetable.original_filename
+            FROM pending_reviews AS pending
+            LEFT JOIN timetables AS timetable
+              ON timetable.timetable_id = pending.timetable_id
+            ORDER BY pending.updated_at DESC, pending.rowid DESC
+            """
+        ).fetchall()
+
+    return [
+        {
+            "timetable_id": row["timetable_id"],
+            "original_filename": row["original_filename"],
+            "updated_at": row["updated_at"],
+            "payload": json.loads(row["payload_json"]),
+        }
+        for row in rows
+    ]
+
+
 def delete_timetable(timetable_id):
     """Delete a timetable and its associated entries atomically."""
     with get_connection() as connection:
@@ -523,6 +586,14 @@ def delete_timetable(timetable_id):
             (timetable_id,),
         )
 
+        connection.execute(
+            "DELETE FROM timetable_courses WHERE timetable_id = ?",
+            (timetable_id,),
+        )
+        connection.execute(
+            "DELETE FROM pending_reviews WHERE timetable_id = ?",
+            (timetable_id,),
+        )
         registry_cursor = connection.execute(
             "DELETE FROM timetables WHERE timetable_id = ?",
             (timetable_id,),

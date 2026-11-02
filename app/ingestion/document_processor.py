@@ -55,7 +55,7 @@ def process_timetable_image(
     """
     Extract OCR text, bounding boxes and confidence from an image.
 
-    Returns evidence suitable for document_intelligence.py.
+    Used to cross-check text reported by the vision model.
     Coordinates are provided in both original and processed image space.
     """
     image_path = Path(image_path)

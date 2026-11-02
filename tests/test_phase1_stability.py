@@ -123,7 +123,7 @@ def test_ai_features_are_disabled_without_api_key(monkeypatch):
         == genai_assistant.AI_UNAVAILABLE_MESSAGE
     )
     with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
-        genai_assistant.gemini_extraction_client("system", "user")
+        genai_assistant.gemini_vision_client(b"", "image/png", "prompt", None)
     with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
         genai_assistant.get_client()
 

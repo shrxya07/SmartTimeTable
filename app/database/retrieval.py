@@ -102,6 +102,35 @@ def get_verified_teacher_identities():
     ]
 
 
+def get_verified_rooms():
+    """Return distinct room names used by verified entries."""
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT TRIM(room) AS room
+            FROM timetable_entries
+            WHERE review_status = 'verified'
+              AND room IS NOT NULL AND TRIM(room) <> ''
+            ORDER BY room
+            """
+        ).fetchall()
+    return [row["room"] for row in rows]
+
+
+def get_verified_classes():
+    """Return distinct class names with their semester and section."""
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT DISTINCT class_name, semester, section
+            FROM timetable_entries
+            WHERE review_status = 'verified'
+            ORDER BY semester, section, class_name
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_timetable_entries(timetable_id, review_status=None):
     """Retrieve entries belonging to one timetable."""
     query = """
