@@ -42,13 +42,11 @@ def timetable(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("query", ["Dr. Rao", "rao", "DR RAO", "Prof Rao"])
 def test_teacher_names_match_despite_titles_and_punctuation(query):
-    assert assistant.resolve_teacher_name(query) == {"teacher_name": "Dr Rao"}
+    assert assistant.resolve_teacher_name(query)["teacher_name"] == "Dr Rao"
 
 
 def test_initials_and_co_teachers_resolve():
-    assert assistant.resolve_teacher_name("MRC") == {
-        "teacher_name": "MANJULA CHOUGALA",
-    }
+    assert assistant.resolve_teacher_name("MRC")["teacher_name"] == "MANJULA CHOUGALA"
     schedule = assistant.get_teacher_schedule("Manjula", "monday")
     assert [entry["subject"] for entry in schedule] == ["DS Lab"]
 
@@ -65,7 +63,7 @@ def test_teacher_location_accepts_12_hour_time_and_short_day():
 
 
 def test_room_lookup_is_fuzzy_and_ignores_unapproved_records():
-    assert assistant.resolve_room("lhc301") == {"room": "LHC 301"}
+    assert assistant.resolve_room("lhc301")["room"] == "LHC 301"
     assert [e["subject"] for e in assistant.get_room_schedule(
         "LHC-301", "Monday", "9:30")] == ["Data Structures"]
     assert assistant.get_room_schedule("LHC 301", "Monday", "11:30") == []
@@ -96,7 +94,7 @@ def test_free_time_skips_inferred_breaks_and_uses_real_day_hours():
             "timetable_id": "t5b",
         })
 
-    free = assistant.get_teacher_free_slots("rao", "Tuesday")
+    free = assistant.get_teacher_free_slots("rao", "Tuesday")["free_periods"]
     spans = [(slot["start_time"], slot["end_time"]) for slot in free]
     assert ("10:50", "11:05") not in spans
     assert spans[-1][1] == "16:30"  # Tuesday's last class, not 17:00
@@ -124,6 +122,99 @@ def test_breaks_are_inferred_from_all_classes_for_a_sparse_class():
     free = assistant.get_class_free_slots("Monday", class_name="3A")
     spans = [(slot["start_time"], slot["end_time"]) for slot in free]
     assert all(not (s < "13:00" < e) for s, e in spans), spans
+
+
+def test_teacher_free_time_checks_every_class_however_the_name_is_written():
+    # One teacher, written three ways in three timetables.
+    for class_name, start, end, teacher, teachers in (
+        ("5A", "09:00", "09:55", "DR.SUSHMA B", None),
+        ("3B", "11:05", "12:00", "Dr Sushma B", None),
+        ("7C", "13:45", "14:40", "SB", None),
+        ("7C", "14:40", "15:35", "Other Teacher",
+         [{"teacher_name": "Other Teacher"}, {"teacher_name": "DR SUSHMA B", "initials": "SB"}]),
+    ):
+        db.insert_entry({
+            "subject": "OOAD", "teacher_name": teacher, "teachers": teachers,
+            "class_name": class_name, "day": "Wednesday", "start_time": start,
+            "end_time": end, "room": "LHC 206", "review_status": "verified",
+            "timetable_id": f"t{class_name}",
+        })
+
+    assert assistant.resolve_teacher_name("Sushma")["teacher_name"] in {
+        "DR.SUSHMA B", "Dr Sushma B", "DR SUSHMA B",
+    }
+    result = assistant.get_teacher_free_slots("dr. sushma", "Wednesday")
+
+    busy = [(p["start_time"], p["class_name"]) for p in result["busy_periods"]]
+    assert busy == [("09:00", "5A"), ("11:05", "3B"), ("13:45", "7C"), ("14:40", "7C")]
+    assert result["classes_checked"] == ["3B", "5A", "7C"]
+    for slot in result["free_periods"]:
+        for start, _ in busy:
+            assert not (slot["start_time"] <= start < slot["end_time"]), slot
+    assert assistant.get_teacher_location("SB", "Wednesday", "11:30")[0]["class_name"] == "3B"
+    assert sum(
+        "sushma" in name.lower()
+        for name in assistant.list_known_timetable_data()["teachers"]
+    ) == 1
+
+
+def test_gaps_between_header_periods_count_as_breaks():
+    db.register_timetable("t3a", "3a.png", "3a.png")
+    db.save_timetable_layout("t3a", {
+        "breaks": [["12:55", "13:45"]],
+        "periods": [["09:00", "09:55"], ["09:55", "10:50"], ["11:05", "12:00"],
+                    ["12:00", "12:55"], ["13:45", "14:40"]],
+    })
+    free = assistant.get_class_free_slots("Monday", class_name="3A")
+    spans = [(slot["start_time"], slot["end_time"]) for slot in free]
+    assert ("09:55", "10:50") in spans and ("11:05", "12:55") in spans
+    assert all(not (s < "11:00" < e) for s, e in spans), spans
+
+
+def test_lab_free_time_checks_every_class_however_the_lab_is_written():
+    # One lab, written differently by three classes, once in a shared booking.
+    for class_name, start, end, room in (
+        ("3A", "09:00", "10:50", "CSE LAB1"),
+        ("5D", "11:05", "12:55", "CSE LAB 1"),
+        ("7C", "13:45", "14:40", "CSE LAB 3 & CSE-Lab 1"),
+        ("7C", "14:40", "15:35", "CSE LAB 2"),
+    ):
+        db.insert_entry({
+            "subject": "Lab", "teacher_name": "Someone", "class_name": class_name,
+            "day": "Thursday", "start_time": start, "end_time": end, "room": room,
+            "entry_type": "lab", "review_status": "verified",
+            "timetable_id": f"t{class_name}",
+        })
+
+    resolved = assistant.resolve_room("cse lab 1")
+    assert "error" not in resolved
+    result = assistant.get_room_free_slots("Lab 1", "Thursday")
+
+    busy = [(p["start_time"], p["class_name"]) for p in result["busy_periods"]]
+    assert busy == [("09:00", "3A"), ("11:05", "5D"), ("13:45", "7C")]
+    assert result["classes_checked"] == ["3A", "5D", "7C"]
+    spans = [(s["start_time"], s["end_time"]) for s in result["free_periods"]]
+    # Thursday's last class in this data ends at 15:35 (CSE LAB 2, not Lab 1).
+    assert spans == [("14:40", "15:35")]
+    assert assistant.get_room_schedule("cselab1", "Thursday", "14:00")[0]["class_name"] == "7C"
+    assert sum(
+        name.replace(" ", "").replace("-", "").upper() == "CSELAB1"
+        for name in assistant.list_known_timetable_data()["rooms"]
+    ) == 1
+
+
+def test_one_lab_written_two_ways_is_a_room_clash():
+    from app.scheduling.engine import detect_conflicts
+
+    for class_name, room in (("3A", "CSE LAB1"), ("5D", "CSE LAB 1 & CSE LAB 2")):
+        db.insert_entry({
+            "subject": f"Lab {class_name}", "teacher_name": f"T{class_name}",
+            "class_name": class_name, "day": "Friday", "start_time": "09:00",
+            "end_time": "10:50", "room": room, "entry_type": "lab",
+            "review_status": "verified", "timetable_id": f"t{class_name}",
+        })
+    clashes = [c for c in detect_conflicts(day="Friday") if "room" in c["conflict_types"]]
+    assert len(clashes) == 1
 
 
 def test_free_time_on_a_day_without_data_is_unknown_not_free():

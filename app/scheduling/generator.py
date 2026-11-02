@@ -17,6 +17,9 @@ session with the fewest remaining options next (minimum remaining values).
 """
 
 from dataclasses import dataclass, field
+import re
+
+from app.scheduling.engine import split_rooms
 
 
 @dataclass
@@ -39,7 +42,16 @@ def _minutes(clock):
 
 
 def _key(value):
-    return " ".join(str(value or "").casefold().split())
+    """Same teacher/room despite spelling: 'CSE LAB1' == 'cse lab 1'."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def _by_key(bookings):
+    """Group bookings by name key, merging spellings of the same name."""
+    grouped = {}
+    for name, intervals in (bookings or {}).items():
+        grouped.setdefault(_key(name), []).extend(intervals)
+    return grouped
 
 
 def _overlaps(first, second):
@@ -59,14 +71,8 @@ class _Problem:
             (_minutes(start), _minutes(end)) for start, end in self.periods
         ]
         self.busy = {
-            "teacher": {
-                _key(name): list(intervals)
-                for name, intervals in (busy or {}).get("teacher", {}).items()
-            },
-            "room": {
-                _key(name): list(intervals)
-                for name, intervals in (busy or {}).get("room", {}).items()
-            },
+            "teacher": _by_key((busy or {}).get("teacher")),
+            "room": _by_key((busy or {}).get("room")),
         }
         self.sessions = [
             (index, requirement)
@@ -350,21 +356,19 @@ def check_timetable(records, busy=None):
                     f"{first['start_time']}: {first['course']} / {second['course']}"
                 )
     busy = busy or {}
+    teacher_busy = _by_key(busy.get("teacher"))
+    room_busy = _by_key(busy.get("room"))
     for record, span in timed:
         for teacher in record.get("teachers") or []:
             name = _key(teacher.get("teacher_name"))
-            for day, busy_span in {
-                _key(k): v for k, v in busy.get("teacher", {}).items()
-            }.get(name, []):
+            for day, busy_span in teacher_busy.get(name, []):
                 if day == record["day"] and _overlaps(span, busy_span):
                     violations.append(
                         f"{teacher['teacher_name']} also teaches elsewhere on "
                         f"{day} {record['start_time']}"
                     )
-        for room in (record.get("room") or "").split(" & "):
-            for day, busy_span in {
-                _key(k): v for k, v in busy.get("room", {}).items()
-            }.get(_key(room), []):
+        for room in split_rooms(record.get("room")):
+            for day, busy_span in room_busy.get(_key(room), []):
                 if room and day == record["day"] and _overlaps(span, busy_span):
                     violations.append(f"room {room} is taken on {day} {record['start_time']}")
     return violations

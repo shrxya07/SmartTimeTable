@@ -106,7 +106,13 @@ def get_verified_teacher_identities():
 
 
 def get_verified_rooms():
-    """Return distinct room names used by verified entries."""
+    """Every room spelling used by verified entries.
+
+    A booking naming several rooms ("AB 701 & AB702") contributes each one.
+    Spellings of the same room are all returned; callers group them.
+    """
+    from app.scheduling.engine import split_rooms
+
     with get_connection() as connection:
         rows = connection.execute(
             """
@@ -114,10 +120,9 @@ def get_verified_rooms():
             FROM timetable_entries
             WHERE review_status = 'verified'
               AND room IS NOT NULL AND TRIM(room) <> ''
-            ORDER BY room
             """
         ).fetchall()
-    return [row["room"] for row in rows]
+    return sorted({part for row in rows for part in split_rooms(row["room"])})
 
 
 def get_verified_classes():
@@ -267,7 +272,7 @@ def get_day_layout(day, class_name=None):
         return None
 
     break_sets = [
-        {tuple(item) for item in json.loads(row["layout_json"]).get("breaks") or []}
+        _layout_breaks(json.loads(row["layout_json"]))
         for row in layouts
     ]
     if break_sets:
@@ -285,6 +290,23 @@ def get_day_layout(day, class_name=None):
         "working_end": bounds["day_end"],
         "breaks": breaks,
     }
+
+
+def _layout_breaks(layout):
+    """Breaks marked in a period header, plus short gaps between periods.
+
+    Many timetables print no column for a tea break; it shows only as a gap
+    in the times (9.55-10.50 then 11.05-12.00).
+    """
+    breaks = {tuple(item) for item in layout.get("breaks") or []}
+    periods = sorted(
+        (tuple(item) for item in layout.get("periods") or []),
+        key=lambda item: _minutes(item[0]),
+    )
+    for (_, end), (start, _) in zip(periods, periods[1:]):
+        if 0 < _minutes(start) - _minutes(end) <= MAX_INFERRED_BREAK_MINUTES:
+            breaks.add((end, start))
+    return breaks
 
 
 def _inferred_breaks(slots):

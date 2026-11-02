@@ -3,6 +3,7 @@
 import json
 
 from app.database.db import get_connection
+from app.scheduling.engine import split_rooms
 from app.scheduling.generator import Requirement
 
 
@@ -43,8 +44,8 @@ def existing_commitments(exclude_class=None):
         for name in entry["all_teachers"]:
             busy["teacher"].setdefault(name, []).append(span)
         if entry.get("room"):
-            for room in str(entry["room"]).split(" & "):
-                busy["room"].setdefault(room.strip(), []).append(span)
+            for room in split_rooms(entry["room"]):
+                busy["room"].setdefault(room, []).append(span)
     return busy
 
 

@@ -5,17 +5,19 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
-from app.database.retrieval import search_entries
 from app.genai_assistant import (
     get_class_free_slots,
     get_room_free_slots,
     get_teacher_free_slots,
     list_known_timetable_data,
+    resolve_room,
+    resolve_teacher_name,
 )
 from app.ingestion.timetable_validator import DAY_NAMES
 from app.scheduling.engine import (
     detect_conflicts,
     find_class_schedule,
+    find_room_bookings,
     find_teacher_schedule,
 )
 from app.ui.components import present_days, week_grid
@@ -25,6 +27,8 @@ def _free_table(days, lookup):
     rows = []
     for day in days:
         result = lookup(day)
+        if isinstance(result, dict) and "free_periods" in result:
+            result = result["free_periods"]
         if isinstance(result, dict):
             rows.append({"Day": day, "Free": result.get("note") or result.get("error")})
             continue
@@ -69,10 +73,12 @@ def render():
     with teacher_tab:
         teacher = st.selectbox("Teacher", known["teachers"], key="explore_teacher")
         if teacher:
+            # Every spelling and initial of this teacher, across all timetables.
+            aliases = resolve_teacher_name(teacher).get("aliases") or [teacher]
             entries = [
                 entry
                 for day in DAY_NAMES
-                for entry in find_teacher_schedule(teacher, day)
+                for entry in find_teacher_schedule(aliases, day)
             ]
             _show(
                 entries,
@@ -97,9 +103,12 @@ def render():
     with room_tab:
         room = st.selectbox("Room", known["rooms"], key="explore_room")
         if room:
+            # Every spelling of this room, including multi-room bookings.
+            aliases = resolve_room(room).get("aliases") or [room]
             entries = [
-                entry for entry in search_entries(room=room)
-                if entry["room"] and entry["room"].casefold() == room.casefold()
+                entry
+                for day in DAY_NAMES
+                for entry in find_room_bookings(aliases, day)
             ]
             _show(
                 entries,

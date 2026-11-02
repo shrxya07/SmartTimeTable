@@ -95,15 +95,9 @@ def test_resolve_teacher_ignores_null_teachers_and_uses_associations(
         end_time="10:55",
     ))
 
-    assert genai_assistant.resolve_teacher_name("rao") == {
-        "teacher_name": "Dr Rao",
-    }
-    assert genai_assistant.resolve_teacher_name("Asha") == {
-        "teacher_name": "Asha Bhat",
-    }
-    assert genai_assistant.resolve_teacher_name("asb") == {
-        "teacher_name": "Asha Bhat",
-    }
+    assert genai_assistant.resolve_teacher_name("rao")["teacher_name"] == "Dr Rao"
+    assert genai_assistant.resolve_teacher_name("Asha")["teacher_name"] == "Asha Bhat"
+    assert genai_assistant.resolve_teacher_name("asb")["teacher_name"] == "Asha Bhat"
     assert "error" in genai_assistant.resolve_teacher_name("Pending")
 
     schedule = genai_assistant.get_teacher_schedule("Asha", "Monday")

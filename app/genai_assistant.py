@@ -13,11 +13,16 @@ from google.genai.errors import APIError
 from app.database.db import initialize_database
 from app.database.retrieval import (
     get_day_layout,
+    get_faculty_directory,
     get_verified_classes,
     get_verified_rooms,
     get_verified_teacher_identities,
 )
-from app.ingestion.timetable_validator import normalize_clock, normalize_day
+from app.ingestion.timetable_validator import (
+    DAY_NAMES,
+    normalize_clock,
+    normalize_day,
+)
 
 from app.scheduling.engine import (
     find_teacher_schedule,
@@ -25,6 +30,7 @@ from app.scheduling.engine import (
     find_class_schedule,
     find_room_at_time,
     find_free_slots,
+    find_room_bookings,
     find_room_free_slots,
     find_section_free_slots,
     detect_conflicts,
@@ -260,19 +266,56 @@ def resolve_teacher_name(teacher_name: str):
 
     # Includes co-teachers from entry_teachers; NULL names are excluded.
     identities = get_verified_teacher_identities()
-    exact = sorted({
-        identity["teacher_name"]
+    directory = get_faculty_directory()
+
+    # One person per name key: "DR.SUSHMA B" and "Dr Sushma B" are the same
+    # teacher written differently in two timetables.
+    initials_by_person = {}
+    for identity in identities:
+        if identity["initials"]:
+            initials_by_person.setdefault(
+                _name_key(identity["teacher_name"]), set()
+            ).add(_compact(identity["initials"]))
+    for initials, entry in directory.items():
+        if len(entry["names"]) == 1:
+            initials_by_person.setdefault(
+                _name_key(entry["names"][0]), set()
+            ).add(_compact(initials))
+
+    exact = {
+        _name_key(identity["teacher_name"])
         for identity in identities
         if query == _name_key(identity["teacher_name"])
         or query == _compact(identity["initials"])
-    })
-    matches = exact or sorted({
-        identity["teacher_name"]
+    } | {
+        person for person, initials in initials_by_person.items()
+        if query in initials
+    }
+    people = exact or {
+        _name_key(identity["teacher_name"])
         for identity in identities
         if query in _name_key(identity["teacher_name"])
-    })
+    }
+    # A name that is itself someone's initials ("SB") is that person.
+    people = {
+        next(
+            (person for person, initials in initials_by_person.items()
+             if key in initials and person != key),
+            key,
+        )
+        for key in people
+    }
 
-    if not matches:
+    spellings = {
+        person: sorted({
+            identity["teacher_name"] for identity in identities
+            if _name_key(identity["teacher_name"]) == person
+        })
+        for person in people
+    }
+    spellings = {person: names for person, names in spellings.items() if names}
+
+    if not spellings:
         return {
             "error": (
                 f"No verified timetable records found "
@@ -280,14 +323,23 @@ def resolve_teacher_name(teacher_name: str):
             )
         }
 
-    if len(matches) > 1:
+    if len(spellings) > 1:
         return {
             "error": "Multiple teachers match your query.",
-            "matching_teachers": matches,
+            "matching_teachers": sorted(names[0] for names in spellings.values()),
             "instruction": "Ask the user to specify the teacher."
         }
 
-    return {"teacher_name": matches[0]}
+    person, names = next(iter(spellings.items()))
+    initials = initials_by_person.get(person, set())
+    aliases = set(names) | {
+        identity["teacher_name"] for identity in identities
+        if _compact(identity["teacher_name"]) in initials
+    } | {value.upper() for value in initials}
+    return {
+        "teacher_name": max(names, key=len),
+        "aliases": sorted(aliases),
+    }
 
 
 def resolve_room(room: str):
@@ -295,19 +347,23 @@ def resolve_room(room: str):
     if not room or not room.strip():
         return {"error": "Please provide a room name."}
     query = _compact(room)
-    rooms = get_verified_rooms()
-    matches = [name for name in rooms if _compact(name) == query] or [
-        name for name in rooms if query in _compact(name)
+    # One room per key: "CSE LAB1" and "CSE LAB 1" are the same lab.
+    spellings = {}
+    for name in get_verified_rooms():
+        spellings.setdefault(_compact(name), set()).add(name)
+    keys = [key for key in spellings if key == query] or [
+        key for key in spellings if query in key
     ]
-    if not matches:
+    if not keys:
         return {"error": f"No verified timetable records use room {room}."}
-    if len(matches) > 1:
+    if len(keys) > 1:
         return {
             "error": "Multiple rooms match your query.",
-            "matching_rooms": matches,
+            "matching_rooms": sorted(max(spellings[key], key=len) for key in keys),
             "instruction": "Ask the user to specify the room.",
         }
-    return {"room": matches[0]}
+    names = sorted(spellings[keys[0]])
+    return {"room": max(names, key=len), "aliases": names}
 
 
 def resolve_class(class_name=None, semester=None, section=None):
@@ -390,7 +446,7 @@ def get_teacher_schedule(
         return error
 
     return find_teacher_schedule(
-        resolved["teacher_name"],
+        resolved["aliases"],
         day,
         semester=semester,
         section=section
@@ -412,7 +468,7 @@ def get_teacher_location(
         return error
 
     return find_teacher_at_time(
-        resolved["teacher_name"],
+        resolved["aliases"],
         day,
         time
     )
@@ -480,7 +536,7 @@ def get_room_schedule(
     if error:
         return error
 
-    return find_room_at_time(resolved["room"], day, time)
+    return find_room_at_time(resolved["aliases"], day, time)
 
 
 def get_room_free_slots(
@@ -488,7 +544,8 @@ def get_room_free_slots(
     day: str,
     min_duration_minutes: int = 30,
 ):
-    """Find periods when a room is not used in verified records."""
+    """Find when a room or lab is free on a day, checked against every
+    class that uses it in all approved timetables."""
 
     resolved = resolve_room(room)
     if "error" in resolved:
@@ -500,22 +557,50 @@ def get_room_free_slots(
     if "note" in layout:
         return layout
 
-    return find_room_free_slots(
-        resolved["room"],
-        day,
-        min_duration_minutes=min_duration_minutes,
-        **layout,
-    )
+    aliases = resolved["aliases"]
+    busy = find_room_bookings(aliases, day)
+    week_classes = sorted({
+        entry["class_name"]
+        for other_day in DAY_NAMES
+        for entry in find_room_bookings(aliases, other_day)
+        if entry.get("class_name")
+    })
+    return {
+        "room": resolved["room"],
+        "day": day,
+        "free_periods": find_room_free_slots(
+            aliases,
+            day,
+            min_duration_minutes=min_duration_minutes,
+            **layout,
+        ),
+        "busy_periods": [
+            {
+                "start_time": entry["start_time"],
+                "end_time": entry["end_time"],
+                "class_name": entry.get("class_name"),
+                "subject": entry.get("subject"),
+                "teacher": entry.get("teacher_name"),
+                "group": entry.get("subgroup"),
+            }
+            for entry in busy
+        ],
+        "classes_checked": week_classes,
+        "note": (
+            "Checked against every approved timetable that uses this room. "
+            "Classes whose timetables are not uploaded or approved yet are "
+            "not included."
+        ),
+    }
 
 
 def get_teacher_free_slots(
     teacher_name: str,
     day: str,
     min_duration_minutes: int = 30,
-    semester: int = None,
-    section: str = None
 ):
-    """Find verified free periods in a teacher's schedule."""
+    """Find when a teacher is free on a day, checked against every class
+    they teach in all approved timetables (not just one class)."""
 
     resolved = resolve_teacher_name(teacher_name)
     if "error" in resolved:
@@ -527,14 +612,40 @@ def get_teacher_free_slots(
     if "note" in layout:
         return layout
 
-    return find_free_slots(
-        resolved["teacher_name"],
-        day,
-        min_duration_minutes=min_duration_minutes,
-        semester=semester,
-        section=section,
-        **layout,
-    )
+    aliases = resolved["aliases"]
+    busy = find_teacher_schedule(aliases, day)
+    week_classes = sorted({
+        entry["class_name"]
+        for other_day in DAY_NAMES
+        for entry in find_teacher_schedule(aliases, other_day)
+        if entry.get("class_name")
+    })
+    return {
+        "teacher": resolved["teacher_name"],
+        "day": day,
+        "free_periods": find_free_slots(
+            aliases,
+            day,
+            min_duration_minutes=min_duration_minutes,
+            **layout,
+        ),
+        "busy_periods": [
+            {
+                "start_time": entry["start_time"],
+                "end_time": entry["end_time"],
+                "class_name": entry.get("class_name"),
+                "subject": entry.get("subject"),
+                "room": entry.get("room"),
+            }
+            for entry in sorted(busy, key=lambda item: item["start_time"])
+        ],
+        "classes_checked": week_classes,
+        "note": (
+            "Checked against every approved timetable this teacher appears "
+            "in. Classes whose timetables are not uploaded or approved yet "
+            "are not included."
+        ),
+    }
 
 
 def get_timetable_conflicts(day: str = None):
@@ -550,12 +661,19 @@ def get_timetable_conflicts(day: str = None):
 def list_known_timetable_data():
     """List the teachers, rooms and classes that have verified records."""
 
+    # One entry per person, even when timetables spell the name differently.
+    people = {}
+    for identity in get_verified_teacher_identities():
+        name = identity["teacher_name"]
+        key = _name_key(name)
+        if len(name) > len(people.get(key, "")):
+            people[key] = name
     return {
-        "teachers": sorted({
-            identity["teacher_name"]
-            for identity in get_verified_teacher_identities()
-        }),
-        "rooms": get_verified_rooms(),
+        "teachers": sorted(people.values()),
+        "rooms": sorted({
+            _compact(name): name
+            for name in sorted(get_verified_rooms(), key=len)
+        }.values()),
         "classes": [item["class_name"] for item in get_verified_classes()],
     }
 
@@ -602,6 +720,9 @@ IMPORTANT RULES:
    ask the user for clarification.
 6. If no matching timetable record is found, say so clearly.
 7. Do not calculate free slots yourself. Use the scheduling tool.
+   A teacher's or room's free time is checked across all classes that
+   use it; mention which classes were checked (classes_checked) and what
+   it is busy with (busy_periods) when you answer.
 8. Respect semester and section filters when provided.
 9. Explain results in simple, understandable language.
 10. Do not claim a teacher is physically present at a location.

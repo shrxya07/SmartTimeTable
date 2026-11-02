@@ -77,6 +77,21 @@ def test_other_classes_bookings_are_respected():
     assert all(r["day"] != "Monday" for r in by_course(result, "Maths"))
 
 
+def test_bookings_under_another_spelling_are_still_respected():
+    busy = {"room": {
+        "CSE LAB1": [(day, (540, 650)) for day in DAYS],
+        "CSE LAB 1": [(day, (665, 775)) for day in DAYS],
+    }}
+    result = generate_timetable("3A", DAYS, PERIODS, [
+        Requirement("DS Lab", 5, periods_per_session=2, kind="lab",
+                    teachers=["T"], rooms=["cse-lab 1"]),
+    ], busy=busy)
+
+    assert result["complete"]
+    assert all(minutes(r["start_time"]) >= 13 * 60 for r in result["records"])
+    assert check_timetable(result["records"], busy) == []
+
+
 def test_parallel_sections_need_all_teachers_free():
     busy = {"teacher": {"Section 2 Teacher": [(day, (540, 775)) for day in DAYS]}}
     result = generate_timetable("5A", DAYS, PERIODS, [
