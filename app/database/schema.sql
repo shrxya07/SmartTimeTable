@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS timetables (
 
     status TEXT NOT NULL DEFAULT 'uploaded',
 
+    file_sha256 TEXT,
+    layout_json TEXT,
+
     uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 

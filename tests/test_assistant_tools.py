@@ -86,6 +86,51 @@ def test_class_timetable_and_free_slots():
     assert "error" in assistant.get_class_timetable(class_name="9Z", day="Monday")
 
 
+def test_free_time_skips_inferred_breaks_and_uses_real_day_hours():
+    # Busy everywhere except a 15-minute gap no class ever uses (a break).
+    for start, end in (("09:55", "10:50"), ("11:05", "12:00")):
+        db.insert_entry({
+            "subject": "Maths", "teacher_name": "Other Teacher",
+            "class_name": "5B", "day": "Tuesday", "start_time": start,
+            "end_time": end, "room": "LHC 206", "review_status": "verified",
+            "timetable_id": "t5b",
+        })
+
+    free = assistant.get_teacher_free_slots("rao", "Tuesday")
+    spans = [(slot["start_time"], slot["end_time"]) for slot in free]
+    assert ("10:50", "11:05") not in spans
+    assert spans[-1][1] == "16:30"  # Tuesday's last class, not 17:00
+
+
+def test_free_time_from_stored_header_breaks(monkeypatch):
+    db.register_timetable("t3a", "3a.png", "3a.png")
+    db.save_timetable_layout("t3a", {
+        "day_start": "09:00", "day_end": "16:30",
+        "breaks": [["10:50", "11:05"], ["12:55", "13:45"]],
+    })
+    free = assistant.get_class_free_slots("Monday", class_name="3A")
+    spans = [(slot["start_time"], slot["end_time"]) for slot in free]
+    assert spans == [("09:55", "10:50"), ("11:05", "12:55"), ("13:45", "14:40")]
+
+
+def test_breaks_are_inferred_from_all_classes_for_a_sparse_class():
+    # Another class shows lunch is 12:55-13:45; 3A alone has no such gap.
+    for start, end in (("12:00", "12:55"), ("13:45", "14:40")):
+        db.insert_entry({
+            "subject": "Maths", "teacher_name": "Other", "class_name": "5B",
+            "day": "Wednesday", "start_time": start, "end_time": end,
+            "room": "LHC 206", "review_status": "verified", "timetable_id": "t5b",
+        })
+    free = assistant.get_class_free_slots("Monday", class_name="3A")
+    spans = [(slot["start_time"], slot["end_time"]) for slot in free]
+    assert all(not (s < "13:00" < e) for s, e in spans), spans
+
+
+def test_free_time_on_a_day_without_data_is_unknown_not_free():
+    result = assistant.get_teacher_free_slots("rao", "Sunday")
+    assert "note" in result and "cannot be determined" in result["note"]
+
+
 def test_known_data_lists_only_approved_values():
     known = assistant.list_known_timetable_data()
     assert known["teachers"] == ["AKSHATHA KAMATH", "Dr Rao", "MANJULA CHOUGALA"]

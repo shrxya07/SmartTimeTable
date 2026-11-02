@@ -28,6 +28,27 @@ Upload ─► Gemini vision reads each page into structured JSON
    restart does not lose them) until you select and confirm them.
 4. **Questions**: the assistant answers only from approved records through
    database tools (`app/scheduling/engine.py`, `app/database/retrieval.py`).
+   Names, initials, rooms and class names are matched loosely ("Dr. Rao",
+   "lhc301", "CSE 3A"); free time skips breaks and uses each day's real hours.
+5. **Generation** (`app/scheduling/generator.py`): builds a clash-free week
+   for a class with a backtracking constraint solver. Hard constraints: no
+   class, teacher or room double-booked (including against other classes'
+   approved timetables), labs on consecutive periods that never cross a
+   break, parallel sections/batches kept together, fixed activities and
+   short days (e.g. Saturday) respected. It prefers one session per course
+   per day and an even spread, and explains anything it cannot place. A
+   generated timetable goes through the same review and approval.
+
+## Pages
+
+| Page | What it does |
+|---|---|
+| Chat Assistant | Plain-English questions answered from approved records |
+| Upload Timetable | Image/PDF upload, extraction with progress, duplicate-file warning |
+| Review Extracted Records | Edit, select and approve records; reasons shown for `check` rows |
+| Schedules & Conflicts | Weekly grid per teacher/class/room, free periods, clash report |
+| Generate Timetable | Constraint-based timetable generation, sent to review |
+| Manage Timetables | All uploads with counts; view as a grid; delete |
 
 ## Project structure
 
@@ -38,7 +59,8 @@ SmartTimeTable/
 │   ├── genai_assistant.py      # Gemini client, vision adapter, chat tools
 │   ├── database/               # SQLite schema, storage, retrieval
 │   ├── ingestion/              # Vision extraction, validation, OCR cross-check
-│   └── scheduling/engine.py    # Schedules, free slots, rooms, conflicts
+│   ├── scheduling/             # Queries, free slots, conflicts, generator
+│   └── ui/                     # Schedules, generator and management pages
 ├── tests/
 ├── data/                       # timetable.db and uploads (not in Git)
 ├── requirements.txt
@@ -73,11 +95,17 @@ Create a `.env` file in the project root:
 GEMINI_API_KEY=your-key-here
 # Optional overrides
 GEMINI_VISION_MODEL=gemini-3.5-flash
+GEMINI_VISION_THINKING=minimal
 GEMINI_MODEL=gemini-3.5-flash-lite
 ```
 
 `GEMINI_VISION_MODEL` reads timetables; `GEMINI_MODEL` answers chat
-questions. Without a key the app still starts, shows a warning, and lets you
+questions. `GEMINI_VISION_THINKING=minimal` matched full accuracy on the
+sample timetables in about half the time; set it empty for the model default.
+
+The free tier allows about 5 requests per minute per model. The app waits as
+long as Gemini asks when that limit is hit, and reports a used-up daily
+quota clearly instead of failing with a raw error. Without a key the app still starts, shows a warning, and lets you
 browse and review saved data; uploading and chatting are disabled.
 
 ## Running the application
@@ -96,7 +124,12 @@ python -m streamlit run app/streamlit_app.py
 Then open http://localhost:8501. The database (`data/timetable.db`) is
 created on first start.
 
-Reading a timetable takes about 30-90 seconds per page.
+Reading a timetable takes about 20-35 seconds per page.
+
+Use the virtual environment's Python. If `streamlit` on your PATH belongs to
+another installation (e.g. Anaconda), the app fails with
+`cannot import name 'genai' from 'google'`; run
+`.venv\Scripts\python.exe -m streamlit run app/streamlit_app.py` instead.
 
 ## Running tests
 
@@ -105,7 +138,28 @@ python -m pytest -q
 ```
 
 Tests use temporary databases and a fake vision model, so they need no API
-key and never touch `data/timetable.db`.
+key and never touch `data/timetable.db`. A live accuracy check against a
+hand-verified timetable calls the real API and runs only on request:
+
+```powershell
+$env:SMARTTIMETABLE_LIVE_TESTS = "1"; python -m pytest tests/test_live_extraction.py -v
+```
+
+## Measured accuracy
+
+Checked slot by slot against the printed timetables (day, time, course,
+teachers, room):
+
+| Timetable | Slots correct |
+|---|---|
+| Ramaiah CSE Sem 3-A | 27/27 |
+| Ramaiah CSE Sem 5-A (parallel elective sections, lab batches) | 40/40 |
+| Ramaiah CSE Sem 7-C (handwritten room number) | 24/24 |
+| Generated layout: days as columns, 12-hour times | 13/13 |
+| Generated PDF: abbreviated days, initials legend | 14/14 |
+
+The previous OCR/grid pipeline got about 15/27 on Sem 3-A and nothing on
+Sem 7-C.
 
 ## Notes
 

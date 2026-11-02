@@ -239,6 +239,30 @@ def test_class_name_without_semester_uses_group():
     assert result["records"][0]["start_time"] == "08:30"
 
 
+def test_day_layout_comes_from_period_header():
+    header = build_records(page(
+        [slot("Monday", "09:00", "09:55", "DS")],
+        periods=[
+            {"start_time": "9.00", "end_time": "9.55", "is_break": False},
+            {"start_time": "10.50", "end_time": "11.05", "is_break": True},
+            {"start_time": "12.55", "end_time": "1.45", "is_break": True},
+            {"start_time": "3.35", "end_time": "4.30", "is_break": False},
+        ],
+    ))["header"]
+    assert (header["day_start"], header["day_end"]) == ("09:00", "16:30")
+    assert header["breaks"] == [["10:50", "11:05"], ["12:55", "13:45"]]
+
+
+def test_day_layout_without_header_uses_slot_span_and_no_breaks():
+    header = build_records(page([
+        slot("Monday", "09:00", "09:55", "DS"),
+        slot("Monday", "13:45", "14:40", "DS"),
+    ]))["header"]
+    assert (header["day_start"], header["day_end"], header["breaks"]) == (
+        "09:00", "14:40", [],
+    )
+
+
 def test_course_offerings_flatten_section_assignments():
     offerings = build_records(page([]))["course_offerings"]
     assert {"faculty_name": "DR CHANDRIKA P", "section_label": "2",

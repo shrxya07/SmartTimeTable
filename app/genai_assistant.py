@@ -12,6 +12,7 @@ from google.genai.errors import APIError
 
 from app.database.db import initialize_database
 from app.database.retrieval import (
+    get_day_layout,
     get_verified_classes,
     get_verified_rooms,
     get_verified_teacher_identities,
@@ -40,6 +41,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # Extraction needs the stronger model: flash-lite mis-read merged cells.
 VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash")
+# "minimal" thinking matched full accuracy on the sample timetables in
+# about half the time. Set GEMINI_VISION_THINKING= (empty) for the default.
+VISION_THINKING_LEVEL = os.getenv("GEMINI_VISION_THINKING", "minimal") or None
 
 AI_UNAVAILABLE_MESSAGE = (
     "AI features are disabled because GEMINI_API_KEY is not configured. "
@@ -83,16 +87,58 @@ def get_client():
 # 2. Gemini API retry helper
 # --------------------------------------------------
 
+MAX_RETRY_WAIT_SECONDS = 65
+
+
+class GeminiQuotaError(RuntimeError):
+    """The Gemini quota is used up and waiting a minute will not help."""
+
+
+def _retry_wait_seconds(error, attempt):
+    """Use the delay Gemini asks for (e.g. 'retry in 31s'), else back off."""
+    match = re.search(
+        r"retry(?:Delay['\"]?:\s*['\"]| in )(\d+(?:\.\d+)?)s",
+        str(error),
+    )
+    if match:
+        return min(float(match.group(1)) + 1, MAX_RETRY_WAIT_SECONDS)
+    return min(2 ** attempt, MAX_RETRY_WAIT_SECONDS)
+
+
+def _is_daily_quota(error):
+    return error.code == 429 and "PerDay" in str(error)
+
+
+def describe_gemini_error(error):
+    """A short message for the UI instead of a raw API error dump."""
+    if isinstance(error, GeminiQuotaError):
+        return str(error)
+    if isinstance(error, APIError):
+        if error.code == 429:
+            return (
+                "Gemini's rate limit was reached (the free tier allows a few "
+                "requests per minute). Wait a minute and try again."
+            )
+        if error.code in (500, 502, 503, 504):
+            return "Gemini is temporarily unavailable. Try again shortly."
+        if error.code in (401, 403):
+            return "Gemini rejected the API key. Check GEMINI_API_KEY in .env."
+        return f"Gemini request failed (HTTP {error.code})."
+    return str(error)
+
+
 def generate_content_with_retry(
     contents,
     config,
-    max_attempts=3,
+    max_attempts=5,
     model=None,
 ):
     """
     Call Gemini and retry temporary API failures.
 
-    Retries HTTP 429, 500, 502, 503 and 504 errors.
+    Retries HTTP 429, 500, 502, 503 and 504 errors, waiting as long as a
+    rate-limit response asks (the free tier allows ~5 requests a minute).
+    A used-up daily quota is raised at once as GeminiQuotaError.
     """
 
     retryable_codes = (429, 500, 502, 503, 504)
@@ -121,6 +167,12 @@ def generate_content_with_retry(
 
         except APIError as error:
 
+            if _is_daily_quota(error):
+                raise GeminiQuotaError(
+                    "Gemini's daily free quota for this API key is used up. "
+                    "Try again tomorrow or use a key with billing enabled."
+                ) from error
+
             if error.code not in retryable_codes:
                 raise
 
@@ -128,7 +180,7 @@ def generate_content_with_retry(
                 print("Gemini retry limit reached.")
                 raise
 
-            wait_seconds = 2 ** attempt
+            wait_seconds = _retry_wait_seconds(error, attempt)
 
             print(
                 f"Gemini temporarily unavailable "
@@ -167,6 +219,11 @@ def gemini_vision_client(
             temperature=0,
             response_mime_type="application/json",
             response_schema=response_schema,
+            thinking_config=(
+                types.ThinkingConfig(thinking_level=VISION_THINKING_LEVEL)
+                if VISION_THINKING_LEVEL
+                else None
+            ),
         ),
         model=VISION_MODEL,
     )
@@ -298,6 +355,21 @@ def _check_day_time(day, time_value=None):
     return normalized_day, normalized_time, None
 
 
+def _free_time_layout(day, class_name=None):
+    """Working hours and breaks for free-slot tools, or a note when the
+    approved data has nothing on that day (unknown is not "free")."""
+    layout = get_day_layout(day, class_name)
+    if layout is None:
+        return {
+            "note": (
+                f"No approved timetable records on {day}"
+                + (f" for class {class_name}" if class_name else "")
+                + ", so free time cannot be determined."
+            )
+        }
+    return layout
+
+
 # --------------------------------------------------
 # 5. Real database-backed Gemini tools
 # --------------------------------------------------
@@ -372,7 +444,7 @@ def get_class_free_slots(
     class_name: str = None,
     semester: int = None,
     section: str = None,
-    min_duration_minutes: int = 50,
+    min_duration_minutes: int = 30,
 ):
     """Find periods when a class has nothing scheduled in verified records."""
 
@@ -383,10 +455,14 @@ def get_class_free_slots(
     if "error" in resolved:
         return resolved
 
+    layout = _free_time_layout(day, resolved["class_name"])
+    if "note" in layout:
+        return layout
     return find_section_free_slots(
         resolved["class_name"],
         day,
         min_duration_minutes=min_duration_minutes,
+        **layout,
     )
 
 
@@ -410,7 +486,7 @@ def get_room_schedule(
 def get_room_free_slots(
     room: str,
     day: str,
-    min_duration_minutes: int = 50,
+    min_duration_minutes: int = 30,
 ):
     """Find periods when a room is not used in verified records."""
 
@@ -420,18 +496,22 @@ def get_room_free_slots(
     day, _, error = _check_day_time(day)
     if error:
         return error
+    layout = _free_time_layout(day)
+    if "note" in layout:
+        return layout
 
     return find_room_free_slots(
         resolved["room"],
         day,
         min_duration_minutes=min_duration_minutes,
+        **layout,
     )
 
 
 def get_teacher_free_slots(
     teacher_name: str,
     day: str,
-    min_duration_minutes: int = 60,
+    min_duration_minutes: int = 30,
     semester: int = None,
     section: str = None
 ):
@@ -443,13 +523,17 @@ def get_teacher_free_slots(
     day, _, error = _check_day_time(day)
     if error:
         return error
+    layout = _free_time_layout(day)
+    if "note" in layout:
+        return layout
 
     return find_free_slots(
         resolved["teacher_name"],
         day,
         min_duration_minutes=min_duration_minutes,
         semester=semester,
-        section=section
+        section=section,
+        **layout,
     )
 
 
@@ -592,8 +676,8 @@ def ask_timetable_assistant(question: str, chat_session) -> str:
         print(f"Gemini error after {elapsed:.2f} seconds:", repr(error))
 
         return (
-            "Sorry, I encountered an error while checking "
-            "the timetable. Please try again."
+            "Sorry, I couldn't check the timetable: "
+            f"{describe_gemini_error(error)}"
         )
 
 

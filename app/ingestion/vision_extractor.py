@@ -58,12 +58,19 @@ class LegendRow(BaseModel):
     section_assignments: list[SectionAssignment]
 
 
+class Period(BaseModel):
+    start_time: str
+    end_time: str
+    is_break: bool
+
+
 class TimetablePage(BaseModel):
     institution: Optional[str]
     semester: Optional[str]
     section: Optional[str]
     default_room: Optional[str]
     academic_year: Optional[str]
+    periods: list[Period] = []
     legend: list[LegendRow]
     slots: list[Slot]
     uncertainties: list[str]
@@ -75,6 +82,7 @@ Return every scheduled cell as one slot. Rules:
 - A cell spanning several period columns is ONE slot from the first period's start to the last period's end.
 - Use the period header times; never invent times. Break/lunch columns are not slots unless a cell spans them.
 - Days may be rows or columns; read whichever the layout uses.
+- periods: every period column/row of the time header in order, with is_break true for breaks and lunch (give a break its time span from the neighbouring periods if it has no times printed).
 - entry_type: lecture, lab, tutorial, elective, activity (talks, meetings, partial delivery, projects), or other.
 - cell_text: the exact text printed in the cell.
 - Use the course/faculty table on the page, if there is one, to fill course_name, course_code and teachers. Map initials printed in a cell (e.g. AKK) to full names ONLY when the table shows that mapping; otherwise keep the initials with name null.

@@ -5,6 +5,7 @@ import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 import app.database.db as database
+import app.database.retrieval as retrieval
 
 
 APP_PATH = (
@@ -81,6 +82,7 @@ def make_review_app(
         lambda *args: status_updates.append(args),
     )
     monkeypatch.setattr(database, "get_pending_reviews", lambda: [])
+    monkeypatch.setattr(retrieval, "get_faculty_directory", lambda: {})
     monkeypatch.setattr(database, "save_pending_review", lambda *args: None)
 
     original_editor = st.data_editor

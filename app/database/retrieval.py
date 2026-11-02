@@ -1,4 +1,7 @@
 
+import json
+import re
+
 from app.database.db import get_connection
 
 
@@ -129,6 +132,177 @@ def get_verified_classes():
             """
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _initials_key(value):
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _person_key(value):
+    """Same person despite spelling: 'DR.SUSHMA B' == 'Dr Sushma B'."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def get_faculty_directory():
+    """Department-wide initials -> full name, from every course table.
+
+    Sources: the course/faculty tables read from all uploaded timetables and
+    approved records that store both a name and initials. Returns
+    {initials: {"names": [...], "sources": [...]}}; more than one name means
+    the initials are ambiguous and must not be used to fill a name in.
+    """
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT course.faculty_initials AS initials,
+                   course.faculty_name AS name,
+                   timetable.original_filename AS source
+            FROM timetable_courses AS course
+            LEFT JOIN timetables AS timetable
+              ON timetable.timetable_id = course.timetable_id
+            WHERE course.faculty_initials IS NOT NULL
+              AND course.faculty_name IS NOT NULL
+            UNION ALL
+            SELECT association.initials, association.teacher_name,
+                   timetable.original_filename
+            FROM entry_teachers AS association
+            JOIN timetable_entries AS entry ON entry.id = association.entry_id
+            LEFT JOIN timetables AS timetable
+              ON timetable.timetable_id = entry.timetable_id
+            WHERE entry.review_status = 'verified'
+              AND association.initials <> ''
+              AND association.teacher_name <> association.initials
+            """
+        ).fetchall()
+
+    spellings = {}
+    for row in rows:
+        initials = _initials_key(row["initials"])
+        name = str(row["name"]).strip()
+        if not initials or not name or _initials_key(name) == initials:
+            continue
+        person = spellings.setdefault(initials, {}).setdefault(
+            _person_key(name), {"counts": {}, "sources": set()}
+        )
+        person["counts"][name] = person["counts"].get(name, 0) + 1
+        if row["source"]:
+            person["sources"].add(row["source"])
+
+    directory = {}
+    for initials, people in spellings.items():
+        names, sources = [], set()
+        for person in people.values():
+            # Most common spelling of each distinct person.
+            names.append(max(person["counts"], key=person["counts"].get))
+            sources |= person["sources"]
+        directory[initials] = {"names": sorted(names), "sources": sorted(sources)}
+    return directory
+
+
+MAX_INFERRED_BREAK_MINUTES = 90
+
+
+def _minutes(clock):
+    hour, minute = str(clock).split(":")
+    return int(hour) * 60 + int(minute)
+
+
+def _clock(minutes):
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def get_day_layout(day, class_name=None):
+    """Teaching hours and breaks for free-time questions on one day.
+
+    Hours come from the verified records of that day (so a half-day Saturday
+    ends early). Breaks come from the period headers read at upload; for
+    older timetables without one, a gap that no verified class uses on any
+    day (and is at most 90 minutes) is treated as a break.
+    """
+    class_filter = " AND class_name = ?" if class_name else ""
+    class_params = [class_name] if class_name else []
+
+    with get_connection() as connection:
+        # College hours, not one class's: the earliest start of the week and
+        # the latest end on this day across all classes (half-days end early).
+        bounds = connection.execute(
+            """
+            SELECT
+                (SELECT MIN(start_time) FROM timetable_entries
+                 WHERE review_status = 'verified') AS day_start,
+                MAX(end_time) AS day_end
+            FROM timetable_entries
+            WHERE review_status = 'verified' AND day = ?
+            """,
+            [day],
+        ).fetchone()
+        if class_name and not connection.execute(
+            """
+            SELECT 1 FROM timetable_entries
+            WHERE review_status = 'verified' AND day = ? AND class_name = ?
+            """,
+            [day, class_name],
+        ).fetchone():
+            return None
+        layouts = connection.execute(
+            f"""
+            SELECT DISTINCT timetable.layout_json
+            FROM timetables AS timetable
+            JOIN timetable_entries AS entry
+              ON entry.timetable_id = timetable.timetable_id
+            WHERE entry.review_status = 'verified'
+              AND timetable.layout_json IS NOT NULL{class_filter.replace("class_name", "entry.class_name")}
+            """,
+            class_params,
+        ).fetchall()
+        # Breaks are college-wide, so infer them from every class.
+        all_slots = connection.execute(
+            """
+            SELECT start_time, end_time FROM timetable_entries
+            WHERE review_status = 'verified'
+            """
+        ).fetchall()
+
+    if not bounds["day_end"]:
+        return None
+
+    break_sets = [
+        {tuple(item) for item in json.loads(row["layout_json"]).get("breaks") or []}
+        for row in layouts
+    ]
+    if break_sets:
+        breaks = sorted(set.intersection(*break_sets))
+    else:
+        breaks = _inferred_breaks(all_slots)
+
+    day_start, day_end = _minutes(bounds["day_start"]), _minutes(bounds["day_end"])
+    breaks = [
+        (start, end) for start, end in breaks
+        if day_start < _minutes(end) and _minutes(start) < day_end
+    ]
+    return {
+        "working_start": bounds["day_start"],
+        "working_end": bounds["day_end"],
+        "breaks": breaks,
+    }
+
+
+def _inferred_breaks(slots):
+    """Short gaps between slots that no verified class ever occupies."""
+    if not slots:
+        return []
+    busy = sorted((_minutes(row["start_time"]), _minutes(row["end_time"])) for row in slots)
+    merged = [list(busy[0])]
+    for start, end in busy[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [
+        (_clock(previous[1]), _clock(following[0]))
+        for previous, following in zip(merged, merged[1:])
+        if following[0] - previous[1] <= MAX_INFERRED_BREAK_MINUTES
+    ]
 
 
 def get_timetable_entries(timetable_id, review_status=None):

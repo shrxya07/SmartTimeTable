@@ -151,8 +151,102 @@ def _ocr_supports(cell_text, ocr_key):
     return found / len(words) >= 0.5
 
 
+def _initials_key(value):
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _review_tier(record):
+    return (
+        "auto"
+        if not record["unresolved_fields"] and not record["uncertainties"]
+        else "check"
+    )
+
+
+def apply_faculty_directory(records, directory):
+    """Fill initials-only teachers from the department's other course tables.
+
+    A name is filled in only when the initials map to exactly one person
+    department-wide; ambiguous initials stay unresolved with the candidates
+    listed. Each filled name is noted with its source timetable. Returns the
+    number of teachers filled in.
+    """
+    filled = 0
+    for record in records:
+        notes = record.setdefault("directory_notes", [])
+        for teacher in record.get("teachers") or []:
+            if teacher.get("teacher_name") or not teacher.get("initials"):
+                continue
+            match = (directory or {}).get(_initials_key(teacher["initials"]))
+            if match and len(match["names"]) == 1:
+                teacher["teacher_name"] = match["names"][0]
+                sources = ", ".join(match["sources"][:2]) or "approved records"
+                notes.append(
+                    f"{teacher['initials']} = {teacher['teacher_name']} (from {sources})"
+                )
+                filled += 1
+        _refresh_teacher_checks(record, directory or {})
+    return filled
+
+
+def fill_initials_in_pending_reviews(pending_reviews, directory):
+    """Apply the directory to every pending review.
+
+    ``pending_reviews`` is the list from ``db.get_pending_reviews``. Returns
+    ``[(timetable_id, payload, filled_count)]`` for reviews that changed, so
+    the caller can save them.
+    """
+    changed = []
+    for item in pending_reviews:
+        payload = dict(item["payload"])
+        records = []
+        for record in payload.get("records") or []:
+            record = dict(record)
+            record["teachers"] = [
+                dict(teacher) for teacher in record.get("teachers") or []
+                if isinstance(teacher, dict)
+            ]
+            record["unresolved_fields"] = dict(record.get("unresolved_fields") or {})
+            record["uncertainties"] = list(record.get("uncertainties") or [])
+            record["directory_notes"] = list(record.get("directory_notes") or [])
+            records.append(record)
+        filled = apply_faculty_directory(records, directory)
+        if filled:
+            payload["records"] = records
+            changed.append((item["timetable_id"], payload, filled))
+    return changed
+
+
+def _refresh_teacher_checks(record, directory):
+    teachers = record.get("teachers") or []
+    unknown = [
+        teacher["initials"] for teacher in teachers
+        if not teacher.get("teacher_name") and teacher.get("initials")
+    ]
+    record["unresolved_fields"].pop("teachers", None)
+    if unknown:
+        reasons = []
+        for initials in unknown:
+            match = directory.get(_initials_key(initials))
+            if match and len(match["names"]) > 1:
+                reasons.append(
+                    f"Initials {initials} match several faculty: "
+                    f"{', '.join(match['names'])}"
+                )
+            else:
+                reasons.append(f"Initials {initials} are not defined in any course table")
+        record["unresolved_fields"]["teachers"] = "; ".join(reasons)
+
+    named = next((t["teacher_name"] for t in teachers if t.get("teacher_name")), None)
+    if named:
+        record["teacher_name"] = named
+        record["unresolved_fields"].pop("teacher_name", None)
+    record["review_tier"] = _review_tier(record)
+
+
 def build_records(page, metadata=None, ocr_text=None,
-                  source_document=None, source_page=1):
+                  source_document=None, source_page=1,
+                  faculty_directory=None):
     """Validate one extracted page and return review records and diagnostics."""
     metadata = dict(metadata or {})
     semester = metadata.get("semester") or parse_semester(page.get("semester"))
@@ -171,15 +265,11 @@ def build_records(page, metadata=None, ocr_text=None,
         ))
 
     _mark_parallel_and_overlaps(records)
-
-    for record in records:
-        record["review_tier"] = (
-            "auto"
-            if not record["unresolved_fields"] and not record["uncertainties"]
-            else "check"
-        )
+    # Also sets each record's review tier.
+    apply_faculty_directory(records, faculty_directory)
 
     header = {
+        **_day_layout(page.get("periods") or [], records),
         "institution": _clean(page.get("institution")),
         "semester": semester,
         "section": section,
@@ -330,6 +420,40 @@ def _mark_parallel_and_overlaps(records):
                     f"Overlaps '{other['original_text']}' "
                     f"({other['start_time']}-{other['end_time']})"
                 )
+
+
+def _day_layout(periods, records):
+    """Teaching-day bounds and breaks from the period header.
+
+    Falls back to the earliest/latest slot when the header has no usable
+    times. Breaks are only taken from the header, never guessed here.
+    """
+    spans, breaks = [], []
+    for period in periods:
+        start, _ = normalize_clock(period.get("start_time"))
+        end, _ = normalize_clock(period.get("end_time"))
+        if not start or not end or _minutes(start) >= _minutes(end):
+            continue
+        spans.append((start, end))
+        if period.get("is_break"):
+            breaks.append([start, end])
+    if not spans:
+        spans = [
+            (record["start_time"], record["end_time"])
+            for record in records
+            if record["start_time"] and record["end_time"]
+        ]
+    if not spans:
+        return {"day_start": None, "day_end": None, "breaks": [], "periods": []}
+    teaching = [
+        list(span) for span in spans if list(span) not in breaks
+    ] if periods else []
+    return {
+        "day_start": min(spans, key=lambda span: _minutes(span[0]))[0],
+        "day_end": max(spans, key=lambda span: _minutes(span[1]))[1],
+        "breaks": sorted(breaks, key=lambda item: _minutes(item[0])),
+        "periods": sorted(teaching, key=lambda item: _minutes(item[0])),
+    }
 
 
 def _course_offerings(legend):
