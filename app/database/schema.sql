@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS timetable_entries (
     source_document TEXT,
     source_page INTEGER,
 
-    review_status TEXT NOT NULL DEFAULT 'verified',
+    review_status TEXT NOT NULL DEFAULT 'needs_review',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CHECK (semester IN (1, 2, 3, 4, 5, 6, 7, 8)),
@@ -82,3 +82,33 @@ ON timetables (semester, section);
 
 CREATE INDEX IF NOT EXISTS idx_timetables_status
 ON timetables (status);
+
+CREATE TABLE IF NOT EXISTS timetable_courses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timetable_id TEXT NOT NULL,
+    course_name TEXT,
+    abbrev TEXT,
+    kind TEXT,
+    section_label TEXT,
+    faculty_name TEXT,
+    faculty_initials TEXT,
+    room TEXT,
+    source_bbox TEXT
+);
+
+-- Extracted records awaiting review, kept so a restart does not lose them.
+CREATE TABLE IF NOT EXISTS pending_reviews (
+    timetable_id TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS entry_teachers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL,
+    teacher_name TEXT NOT NULL,
+    initials TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (entry_id) REFERENCES timetable_entries(id) ON DELETE CASCADE,
+    UNIQUE (entry_id, teacher_name, initials, role)
+);

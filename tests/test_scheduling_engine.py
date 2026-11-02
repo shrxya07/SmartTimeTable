@@ -1,6 +1,7 @@
 
 import pytest
 from app.database import db
+from app.database.retrieval import get_teacher_schedule_across_timetables
 from app.scheduling.engine import (
     find_teacher_schedule,
     find_teacher_at_time,
@@ -34,9 +35,16 @@ def add_entry(
     semester=None,
     section=None,
     review_status="verified",
+    teachers=None,
+    entry_type="class",
+    subgroup=None,
+    parallel_group=None,
+    course_abbrev=None,
+    timetable_id=None,
 ):
-    return db.insert_entry({
+    entry = {
         "teacher_name": teacher,
+        "teachers": teachers,
         "subject": subject,
         "class_name": class_name,
         "day": day,
@@ -46,7 +54,13 @@ def add_entry(
         "semester": semester,
         "section": section,
         "review_status": review_status,
-    })
+        "entry_type": entry_type,
+        "subgroup": subgroup,
+        "parallel_group": parallel_group,
+        "course_abbrev": course_abbrev,
+        "timetable_id": timetable_id,
+    }
+    return db.insert_entry(entry)
 
 
 def test_teacher_schedule_is_ordered_and_case_insensitive(test_database):
@@ -104,6 +118,114 @@ def test_detects_teacher_conflict(test_database):
 
     assert len(conflicts) == 1
     assert "teacher" in conflicts[0]["conflict_types"]
+
+
+def test_teacher_schedule_matches_associations_and_deduplicates(test_database):
+    add_entry(
+        teachers=[
+            {"teacher_name": "Dr Sen", "initials": "DS"},
+            {"teacher_name": "Dr Sen", "initials": "DS"},
+        ],
+    )
+
+    assert len(find_teacher_schedule("Dr Sen", "Monday")) == 1
+    assert len(find_teacher_schedule("DS", "Monday")) == 1
+    assert len(find_teacher_schedule("Dr Rao", "Monday")) == 1
+    assert len(
+        get_teacher_schedule_across_timetables("Dr Sen", day="Monday")
+    ) == 1
+
+
+def test_parallel_subgroups_do_not_conflict(test_database):
+    add_entry(
+        teacher="Dr Rao",
+        class_name="CSE-A",
+        subgroup="S1",
+        parallel_group="lab-block",
+        room="Room 301",
+    )
+    add_entry(
+        teacher="Dr Sen",
+        class_name="CSE-A",
+        subgroup="S2",
+        parallel_group="lab-block",
+        room="Room 302",
+    )
+
+    assert detect_conflicts("Monday") == []
+
+
+def test_different_subgroups_do_not_conflict_by_class_alone(test_database):
+    add_entry(
+        teacher="Dr Rao",
+        class_name="CSE-A",
+        subgroup="S1",
+        room="Room 301",
+    )
+    add_entry(
+        teacher="Dr Sen",
+        class_name="CSE-A",
+        subgroup="S2",
+        room="Room 302",
+    )
+
+    assert detect_conflicts("Monday") == []
+
+
+def test_different_parallel_groups_still_conflict(test_database):
+    add_entry(
+        teacher="Dr Rao",
+        class_name="CSE-A",
+        subgroup="S1",
+        parallel_group="lab-block-1",
+        room="Room 301",
+    )
+    add_entry(
+        teacher="Dr Rao",
+        class_name="CSE-A",
+        subgroup="S2",
+        parallel_group="lab-block-2",
+        room="Room 302",
+    )
+
+    conflicts = detect_conflicts("Monday")
+    assert len(conflicts) == 1
+    assert "teacher" in conflicts[0]["conflict_types"]
+
+
+def test_identical_events_in_different_timetables_are_not_conflicts(
+    test_database,
+):
+    add_entry(
+        timetable_id="semester5_a",
+        course_abbrev="OOAD",
+        subject="Object Oriented Analysis",
+        subgroup="S1",
+    )
+    add_entry(
+        timetable_id="semester5_b",
+        course_abbrev="OOAD",
+        subject="Object Oriented Analysis",
+        subgroup="S1",
+    )
+
+    assert detect_conflicts("Monday") == []
+
+
+def test_null_activity_resources_are_safe_in_conflict_detection(test_database):
+    add_entry(
+        teacher=None,
+        class_name="Industry event",
+        room=None,
+        entry_type="activity",
+    )
+    add_entry(
+        teacher="Dr Rao",
+        class_name="CSE-A",
+        room="Room 301",
+    )
+
+    assert detect_conflicts("Monday") == []
 
 
 def test_back_to_back_classes_are_not_a_conflict(test_database):
