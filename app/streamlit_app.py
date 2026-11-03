@@ -33,6 +33,7 @@ from app.ingestion.timetable_validator import (
 from app.ui import explorer_page, generator_page, manage_page
 from app.ingestion.vision_extractor import SUPPORTED_SUFFIXES
 from app.database.db import (
+    TEACHER_OPTIONAL_TYPES,
     find_timetables_by_hash,
     get_all_entries,
     get_pending_reviews,
@@ -1088,10 +1089,7 @@ elif page == "Review Extracted Records":
                     entry_type = str(
                         normalize_missing(entry.get("entry_type")) or "class"
                     ).casefold()
-                    optional_teacher_room = entry_type in {
-                        "activity",
-                        "break",
-                    }
+                    optional_teacher_room = entry_type in TEACHER_OPTIONAL_TYPES
                     missing = [
                         field
                         for field in (

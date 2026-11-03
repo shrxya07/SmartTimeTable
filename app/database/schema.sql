@@ -99,6 +99,13 @@ CREATE TABLE IF NOT EXISTS timetable_courses (
     source_bbox TEXT
 );
 
+-- Spellings a person confirmed are the same teacher ("MAMTHA A" -> "MAMATHA A").
+CREATE TABLE IF NOT EXISTS teacher_aliases (
+    alias_key TEXT PRIMARY KEY,
+    canonical_name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Extracted records awaiting review, kept so a restart does not lose them.
 CREATE TABLE IF NOT EXISTS pending_reviews (
     timetable_id TEXT PRIMARY KEY,

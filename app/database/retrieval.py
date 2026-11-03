@@ -2,7 +2,7 @@
 import json
 import re
 
-from app.database.db import get_connection
+from app.database.db import get_connection, get_teacher_aliases, person_key
 
 
 def search_entries(
@@ -180,10 +180,13 @@ def get_faculty_directory():
             """
         ).fetchall()
 
+    aliases = get_teacher_aliases()
     spellings = {}
     for row in rows:
         initials = _initials_key(row["initials"])
         name = str(row["name"]).strip()
+        # Spellings a person confirmed are the same teacher count as one.
+        name = aliases.get(person_key(name), name)
         if not initials or not name or _initials_key(name) == initials:
             continue
         person = spellings.setdefault(initials, {}).setdefault(

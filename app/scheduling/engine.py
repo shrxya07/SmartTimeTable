@@ -1,7 +1,7 @@
 
 import re
 
-from app.database.db import get_connection
+from app.database.db import CHOICE_TYPES, get_connection
 
 # A booking may name several rooms: "AB 701 & AB702", "CSE LAB4, CSE LAB2".
 _ROOM_SEPARATORS = re.compile(r"\s*[&,/;+]\s*")
@@ -275,11 +275,16 @@ def detect_conflicts(day=None, include_needs_review=False):
 
             first_class = _identity_value(first.get("class_name"))
             second_class = _identity_value(second.get("class_name"))
+            types = {first.get("entry_type"), second.get("entry_type")}
+            students_choose = (
+                types <= CHOICE_TYPES or "lateral_entry" in types
+            )
             if (
                 first_class
                 and first_class == second_class
                 and _identity_value(first.get("subgroup"))
                 == _identity_value(second.get("subgroup"))
+                and not students_choose
             ):
                 reasons.append("class")
 
@@ -660,7 +665,10 @@ def find_section_free_slots(
         FROM timetable_entries
         WHERE LOWER(class_name) = LOWER(?)
           AND LOWER(day) = LOWER(?)
+          AND COALESCE(entry_type, '') <> 'lateral_entry'
     """
+    # Lateral-entry sessions are for diploma students only, so the rest of
+    # the class is free then.
     params = [class_name.strip(), day.strip()]
 
     if semester is not None:

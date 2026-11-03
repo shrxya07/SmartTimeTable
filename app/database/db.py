@@ -12,6 +12,18 @@ DB_PATH = Path(
     os.getenv("SMARTTIMETABLE_DB_PATH") or DATA_DIR / "timetable.db"
 )
 _TIME_PATTERN = re.compile(r"(\d{1,2}):(\d{2})")
+
+# Sessions with no single class teacher or room: activities, breaks, open
+# electives (students go to different courses) and lateral-entry sessions
+# (diploma students taking first-year courses).
+TEACHER_OPTIONAL_TYPES = {"activity", "break", "open_elective", "lateral_entry"}
+# Sessions students choose between: options at the same time are not clashes.
+CHOICE_TYPES = {"elective", "open_elective"}
+
+
+def person_key(value):
+    """Same name despite spelling: 'DR.SUSHMA B' == 'Dr Sushma B'."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 EXTRACTION_METADATA_COLUMNS = {
     "entry_type": "TEXT",
@@ -206,7 +218,7 @@ def insert_entry(entry, connection=None):
         if not entry.get(field):
             raise ValueError(f"Missing required field: {field}")
 
-    if str(entry["entry_type"]).casefold() not in {"activity", "break"}:
+    if str(entry["entry_type"]).casefold() not in TEACHER_OPTIONAL_TYPES:
         if not entry.get("teacher_name") and not entry_teachers:
             raise ValueError("Missing required field: teacher_name")
         if not entry.get("room"):
@@ -661,6 +673,45 @@ def get_pending_reviews():
         }
         for row in rows
     ]
+
+
+def save_teacher_alias(alias_name, canonical_name):
+    """Record that two spellings are the same teacher (confirmed by a person)."""
+    alias, canonical = person_key(alias_name), str(canonical_name or "").strip()
+    if not alias or not canonical or alias == person_key(canonical):
+        return
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO teacher_aliases (alias_key, canonical_name)
+            VALUES (?, ?)
+            ON CONFLICT (alias_key) DO UPDATE SET
+                canonical_name = excluded.canonical_name
+            """,
+            (alias, canonical),
+        )
+        # Anything that pointed at the old name now points at the new one.
+        connection.execute(
+            "UPDATE teacher_aliases SET canonical_name = ? WHERE canonical_name = ?",
+            (canonical, str(alias_name).strip()),
+        )
+
+
+def get_teacher_aliases():
+    """{person_key(spelling): canonical name} for confirmed same-teacher pairs."""
+    with get_connection() as connection:
+        rows = connection.execute(
+            "SELECT alias_key, canonical_name FROM teacher_aliases"
+        ).fetchall()
+    return {row["alias_key"]: row["canonical_name"] for row in rows}
+
+
+def canonical_teacher(name, aliases=None):
+    """The confirmed canonical spelling of a teacher's name."""
+    if name is None:
+        return None
+    aliases = get_teacher_aliases() if aliases is None else aliases
+    return aliases.get(person_key(name), name)
 
 
 def delete_timetable(timetable_id):

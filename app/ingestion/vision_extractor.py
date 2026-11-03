@@ -83,7 +83,8 @@ Return every scheduled cell as one slot. Rules:
 - Use the period header times; never invent times. Break/lunch columns are not slots unless a cell spans them.
 - Days may be rows or columns; read whichever the layout uses.
 - periods: every period column/row of the time header in order, with is_break true for breaks and lunch (give a break its time span from the neighbouring periods if it has no times printed).
-- entry_type: lecture, lab, tutorial, elective, activity (talks, meetings, partial delivery, projects), or other.
+- entry_type: lecture, lab, tutorial, elective, open_elective (students each attend a different institution-wide elective, so there is no single teacher or room), lateral_entry (sessions for lateral-entry / diploma students taking first-year courses; no class teacher), activity (talks, meetings, partial delivery, projects), or other.
+- Students choose between the courses of an elective or AEC cell (e.g. NOSQL/PE); emit only the per-section or per-option slots, not an extra slot for the whole cell.
 - cell_text: the exact text printed in the cell.
 - Use the course/faculty table on the page, if there is one, to fill course_name, course_code and teachers. Map initials printed in a cell (e.g. AKK) to full names ONLY when the table shows that mapping; otherwise keep the initials with name null.
 - room: room printed in the cell, else the timetable's default room for lectures; null for activities.

@@ -19,7 +19,7 @@ from app.scheduling.generator_data import (
 )
 from app.ui.components import week_grid
 
-KINDS = ["class", "lab", "tutorial", "elective"]
+KINDS = ["class", "lab", "tutorial", "elective", "open_elective"]
 DEFAULT_PERIODS = [
     ("09:00", "09:55"), ("09:55", "10:50"), ("11:05", "12:00"),
     ("12:00", "12:55"), ("13:45", "14:40"), ("14:40", "15:35"),

@@ -11,7 +11,7 @@ from google.genai import types
 from google.genai.errors import APIError
 import httpx
 
-from app.database.db import initialize_database
+from app.database.db import get_teacher_aliases, initialize_database, person_key
 from app.database.retrieval import (
     get_day_layout,
     get_faculty_directory,
@@ -291,6 +291,11 @@ def resolve_teacher_name(teacher_name: str):
     # Includes co-teachers from entry_teachers; NULL names are excluded.
     identities = get_verified_teacher_identities()
     directory = get_faculty_directory()
+    aliases_map = get_teacher_aliases()
+
+    def person_of(name):
+        # Confirmed same-teacher spellings map to one canonical name.
+        return _name_key(aliases_map.get(person_key(name), name))
 
     # One person per name key: "DR.SUSHMA B" and "Dr Sushma B" are the same
     # teacher written differently in two timetables.
@@ -298,27 +303,27 @@ def resolve_teacher_name(teacher_name: str):
     for identity in identities:
         if identity["initials"]:
             initials_by_person.setdefault(
-                _name_key(identity["teacher_name"]), set()
+                person_of(identity["teacher_name"]), set()
             ).add(_compact(identity["initials"]))
     for initials, entry in directory.items():
         if len(entry["names"]) == 1:
             initials_by_person.setdefault(
-                _name_key(entry["names"][0]), set()
+                person_of(entry["names"][0]), set()
             ).add(_compact(initials))
 
     exact = {
-        _name_key(identity["teacher_name"])
+        person_of(identity["teacher_name"])
         for identity in identities
-        if query == _name_key(identity["teacher_name"])
+        if query == person_of(identity["teacher_name"])
         or query == _compact(identity["initials"])
     } | {
         person for person, initials in initials_by_person.items()
         if query in initials
     }
     people = exact or {
-        _name_key(identity["teacher_name"])
+        person_of(identity["teacher_name"])
         for identity in identities
-        if query in _name_key(identity["teacher_name"])
+        if query in person_of(identity["teacher_name"])
     }
     # A name that is itself someone's initials ("SB") is that person.
     people = {
@@ -333,7 +338,7 @@ def resolve_teacher_name(teacher_name: str):
     spellings = {
         person: sorted({
             identity["teacher_name"] for identity in identities
-            if _name_key(identity["teacher_name"]) == person
+            if person_of(identity["teacher_name"]) == person
         })
         for person in people
     }
@@ -360,8 +365,9 @@ def resolve_teacher_name(teacher_name: str):
         identity["teacher_name"] for identity in identities
         if _compact(identity["teacher_name"]) in initials
     } | {value.upper() for value in initials}
+    canonical = aliases_map.get(person_key(names[0]))
     return {
-        "teacher_name": max(names, key=len),
+        "teacher_name": canonical or max(names, key=len),
         "aliases": sorted(aliases),
     }
 
@@ -538,12 +544,37 @@ def get_class_free_slots(
     layout = _free_time_layout(day, resolved["class_name"])
     if "note" in layout:
         return layout
-    return find_section_free_slots(
-        resolved["class_name"],
-        day,
-        min_duration_minutes=min_duration_minutes,
-        **layout,
-    )
+    lateral = [
+        entry for entry in find_class_schedule(
+            class_name=resolved["class_name"], day=day,
+        )
+        if entry.get("entry_type") == "lateral_entry"
+    ]
+    result = {
+        "class_name": resolved["class_name"],
+        "day": day,
+        "free_periods": find_section_free_slots(
+            resolved["class_name"],
+            day,
+            min_duration_minutes=min_duration_minutes,
+            **layout,
+        ),
+    }
+    if lateral:
+        result["lateral_entry_sessions"] = [
+            {
+                "start_time": entry["start_time"],
+                "end_time": entry["end_time"],
+                "subject": entry.get("subject"),
+                "room": entry.get("room"),
+            }
+            for entry in lateral
+        ]
+        result["note"] = (
+            "Lateral-entry sessions are only for diploma (lateral-entry) "
+            "students, so the rest of the class is free then."
+        )
+    return result
 
 
 def get_room_schedule(
@@ -686,9 +717,12 @@ def list_known_timetable_data():
     """List the teachers, rooms and classes that have verified records."""
 
     # One entry per person, even when timetables spell the name differently.
+    aliases_map = get_teacher_aliases()
     people = {}
     for identity in get_verified_teacher_identities():
-        name = identity["teacher_name"]
+        name = aliases_map.get(
+            person_key(identity["teacher_name"]), identity["teacher_name"]
+        )
         key = _name_key(name)
         if len(name) > len(people.get(key, "")):
             people[key] = name

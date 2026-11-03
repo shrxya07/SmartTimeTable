@@ -7,6 +7,8 @@ review tier. No record is ever marked verified; that is the reviewer's job.
 
 import re
 
+from app.database.db import CHOICE_TYPES, TEACHER_OPTIONAL_TYPES
+
 
 DAY_NAMES = (
     "Monday", "Tuesday", "Wednesday", "Thursday",
@@ -29,10 +31,32 @@ ENTRY_TYPES = {
     "practical": "lab",
     "tutorial": "tutorial",
     "elective": "elective",
+    "open_elective": "open_elective",
+    "open elective": "open_elective",
+    "lateral_entry": "lateral_entry",
+    "lateral entry": "lateral_entry",
     "activity": "activity",
     "break": "break",
 }
-OPTIONAL_TEACHER_ROOM_TYPES = {"activity", "break"}
+OPTIONAL_TEACHER_ROOM_TYPES = TEACHER_OPTIONAL_TYPES
+
+_LATERAL_ENTRY = re.compile(r"lateral\s*entry", re.IGNORECASE)
+_OPEN_ELECTIVE = re.compile(r"\bopen\s*elective\b|^\s*OE\s*$", re.IGNORECASE)
+
+
+def special_entry_type(*texts):
+    """Sessions with no single class teacher, recognised from their text.
+
+    Lateral entry: diploma students taking first-year courses. Open
+    elective: every student attends a different elective course.
+    """
+    for text in texts:
+        if text and _LATERAL_ENTRY.search(str(text)):
+            return "lateral_entry"
+    for text in texts:
+        if text and _OPEN_ELECTIVE.search(str(text)):
+            return "open_elective"
+    return None
 
 _CLOCK = re.compile(
     r"^\s*(\d{1,2})\s*[:.]\s*(\d{2})\s*(a\.?m\.?|p\.?m\.?)?\s*$",
@@ -264,7 +288,7 @@ def build_records(page, metadata=None, ocr_text=None,
             source_document, source_page,
         ))
 
-    _mark_parallel_and_overlaps(records)
+    records = _mark_parallel_and_overlaps(records)
     # Also sets each record's review tier.
     apply_faculty_directory(records, faculty_directory)
 
@@ -311,7 +335,9 @@ def _slot_record(slot, class_name, semester, section, course_keys,
         uncertainties.append("Afternoon time assumed from a time written without AM/PM")
 
     raw_type = (_clean(slot.get("entry_type")) or "").casefold()
-    entry_type = ENTRY_TYPES.get(raw_type, "class")
+    entry_type = special_entry_type(
+        cell_text, slot.get("course_abbrev"), slot.get("course_name"),
+    ) or ENTRY_TYPES.get(raw_type, "class")
     optional = entry_type in OPTIONAL_TEACHER_ROOM_TYPES
 
     course_abbrev = _clean(slot.get("course_abbrev"))
@@ -388,8 +414,35 @@ def _slot_record(slot, class_name, semester, section, course_keys,
     }
 
 
+def _is_alternative(first, second):
+    """Students choose between these, so sharing a time is not a clash."""
+    return (
+        first["entry_type"] in CHOICE_TYPES and second["entry_type"] in CHOICE_TYPES
+    ) or "lateral_entry" in (first["entry_type"], second["entry_type"])
+
+
 def _mark_parallel_and_overlaps(records):
-    """Group simultaneous sections/batches and flag genuine overlaps."""
+    """Group simultaneous sections/batches and flag genuine overlaps.
+
+    Returns the records, minus a whole-cell record (no group) that the model
+    also split into sections ("AEC NOSQL/PE" plus Section 1-4).
+    """
+    by_cell = {}
+    for record in records:
+        by_cell.setdefault(
+            (record["day"], record["start_time"], record["end_time"],
+             _key(record["original_text"])),
+            [],
+        ).append(record)
+    duplicates = {
+        id(record)
+        for group in by_cell.values()
+        if sum(1 for record in group if record["subgroup"]) >= 2
+        for record in group
+        if not record["subgroup"]
+    }
+    records = [record for record in records if id(record) not in duplicates]
+
     timed = [r for r in records if r["day"] and r["start_time"] and r["end_time"]]
     by_slot = {}
     for record in timed:
@@ -398,7 +451,10 @@ def _mark_parallel_and_overlaps(records):
         ).append(record)
     for (day, start, end), group in by_slot.items():
         subgroups = [record["subgroup"] for record in group]
-        if len(group) > 1 and all(subgroups) and len(set(subgroups)) == len(group):
+        same_cell = len({_key(record["original_text"]) for record in group}) == 1
+        if len(group) > 1 and (
+            (all(subgroups) and len(set(subgroups)) == len(group)) or same_cell
+        ):
             for record in group:
                 record["parallel_group"] = f"{day} {start}-{end}"
 
@@ -415,11 +471,53 @@ def _mark_parallel_and_overlaps(records):
                 continue
             if first["subgroup"] and second["subgroup"] and first["subgroup"] != second["subgroup"]:
                 continue
+            if _is_alternative(first, second):
+                continue
             for record, other in ((first, second), (second, first)):
                 record["uncertainties"].append(
                     f"Overlaps '{other['original_text']}' "
                     f"({other['start_time']}-{other['end_time']})"
                 )
+    return records
+
+
+def revalidate_records(records, directory=None):
+    """Re-apply the current rules to records extracted earlier.
+
+    Used for reviews still pending when rules change: session types are
+    re-recognised, overlap flags recomputed, and initials re-filled.
+    """
+    checked = []
+    for original in records:
+        record = dict(original)
+        record["teachers"] = [
+            dict(teacher) for teacher in record.get("teachers") or []
+            if isinstance(teacher, dict)
+        ]
+        record["unresolved_fields"] = dict(record.get("unresolved_fields") or {})
+        record["uncertainties"] = [
+            item for item in record.get("uncertainties") or []
+            if not str(item).startswith("Overlaps ")
+        ]
+        record["directory_notes"] = list(record.get("directory_notes") or [])
+        record["parallel_group"] = None
+        special = special_entry_type(
+            record.get("original_text"), record.get("course_abbrev"),
+            record.get("course"),
+        )
+        if special:
+            record["entry_type"] = special
+        if record.get("entry_type") in OPTIONAL_TEACHER_ROOM_TYPES:
+            for field in ("teacher_name", "room"):
+                record["unresolved_fields"].pop(field, None)
+            record["uncertainties"] = [
+                item for item in record["uncertainties"]
+                if item != "Course not found in the page's course table"
+            ]
+        checked.append(record)
+    checked = _mark_parallel_and_overlaps(checked)
+    apply_faculty_directory(checked, directory or {})
+    return checked
 
 
 def _day_layout(periods, records):

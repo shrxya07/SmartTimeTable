@@ -5,9 +5,88 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
-from app.database.db import delete_timetable, get_timetable_overview
-from app.database.retrieval import get_timetable_entries
+from app.database.db import (
+    delete_timetable,
+    get_pending_reviews,
+    get_timetable_overview,
+    save_pending_review,
+    save_teacher_alias,
+)
+from app.database.retrieval import (
+    get_faculty_directory,
+    get_timetable_entries,
+    get_verified_teacher_identities,
+)
+from app.ingestion.timetable_validator import revalidate_records
 from app.ui.components import week_grid
+
+
+def refresh_pending_reviews():
+    """Re-check every pending review with the current rules and names."""
+    directory = get_faculty_directory()
+    changed = 0
+    for item in get_pending_reviews():
+        payload = dict(item["payload"])
+        records = payload.get("records") or []
+        if not records:
+            continue
+        payload["records"] = revalidate_records(records, directory)
+        save_pending_review(item["timetable_id"], payload)
+        changed += 1
+    return changed
+
+
+def render_teacher_merge():
+    st.subheader("Same teacher, different spelling")
+    st.caption(
+        "Timetables sometimes spell one teacher differently (\"MAMTHA A\" / "
+        "\"MAMATHA A\"). Confirm they are the same person once, and every "
+        "lookup, free-time answer and initials fill treats them as one."
+    )
+    if st.session_state.get("merge_notice"):
+        st.success(st.session_state.pop("merge_notice"))
+    directory = get_faculty_directory()
+    suggestions = {
+        initials: entry["names"]
+        for initials, entry in sorted(directory.items())
+        if len(entry["names"]) > 1
+    }
+    for initials, names in suggestions.items():
+        left, right = st.columns([3, 1])
+        keep = left.selectbox(
+            f"Initials {initials}: {' / '.join(names)}. Keep which spelling?",
+            names,
+            key=f"merge_keep_{initials}",
+        )
+        if right.button("Same person", key=f"merge_{initials}"):
+            for name in names:
+                if name != keep:
+                    save_teacher_alias(name, keep)
+            refreshed = refresh_pending_reviews()
+            st.session_state.merge_notice = (
+                f"Merged into {keep}; re-checked {refreshed} pending review(s)."
+            )
+            st.rerun()
+
+    spellings = sorted(
+        {identity["teacher_name"] for identity in get_verified_teacher_identities()}
+        | {name for entry in directory.values() for name in entry["names"]}
+    )
+    with st.expander("Merge two other names"):
+        first = st.selectbox("This name", spellings, key="merge_first")
+        second = st.selectbox("is the same teacher as", spellings, key="merge_second")
+        if st.button(
+            "Merge",
+            disabled=not first or first == second,
+            key="merge_manual",
+        ):
+            save_teacher_alias(first, second)
+            refreshed = refresh_pending_reviews()
+            st.session_state.merge_notice = (
+                f"{first} is now treated as {second}; re-checked "
+                f"{refreshed} pending review(s)."
+            )
+            st.rerun()
 
 
 def render():
@@ -64,6 +143,8 @@ def render():
         st.dataframe(week_grid(entries), width="stretch")
     else:
         st.info("This timetable has no approved records yet.")
+
+    render_teacher_merge()
 
     with st.expander("Delete this timetable"):
         item = by_id[selected]

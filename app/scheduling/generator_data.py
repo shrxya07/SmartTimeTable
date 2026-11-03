@@ -130,7 +130,7 @@ def requirements_from_class(class_name, periods=None):
     occurrences = {}
     fixed = []
     for entry in entries:
-        if entry.get("entry_type") in ("activity", "break"):
+        if entry.get("entry_type") in ("activity", "break", "lateral_entry"):
             fixed.append((entry["day"], entry["start_time"], entry["end_time"]))
             continue
         key = (
