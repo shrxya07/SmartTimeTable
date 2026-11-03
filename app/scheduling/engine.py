@@ -1,5 +1,49 @@
 
-from app.database.db import get_connection
+import re
+
+from app.database.db import CHOICE_TYPES, get_connection
+
+# A booking may name several rooms: "AB 701 & AB702", "CSE LAB4, CSE LAB2".
+_ROOM_SEPARATORS = re.compile(r"\s*[&,/;+]\s*")
+
+
+def room_key(value):
+    """Same room despite spelling: 'CSE LAB1' == 'cse lab 1' == 'CSE-Lab 1'."""
+    return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+
+
+def split_rooms(value):
+    """Each room named in a booking's room text."""
+    return [
+        part.strip()
+        for part in _ROOM_SEPARATORS.split(str(value or ""))
+        if part.strip()
+    ]
+
+
+def find_room_bookings(room, day, include_needs_review=False):
+    """Every entry using a room on a day, across all timetables.
+
+    ``room`` may be one name or a list of the room's spellings; bookings
+    that list several rooms count for each of them.
+    """
+    names = [room] if isinstance(room, str) else list(room or [])
+    keys = {room_key(name) for name in names if room_key(name)}
+    if not keys:
+        return []
+    query = """
+        SELECT * FROM timetable_entries
+        WHERE LOWER(day) = LOWER(?) AND room IS NOT NULL
+    """
+    if not include_needs_review:
+        query += " AND review_status = 'verified'"
+    query += " ORDER BY start_time"
+    with get_connection() as conn:
+        rows = conn.execute(query, (day.strip(),)).fetchall()
+    return [
+        dict(row) for row in rows
+        if any(room_key(part) in keys for part in split_rooms(row["room"]))
+    ]
 
 
 def _to_minutes(time_str):
@@ -16,30 +60,37 @@ def find_teacher_schedule(
     section=None,
     include_needs_review=False,
 ):
-    """Return a teacher's classes with optional semester/section filters."""
+    """Return a teacher's classes with optional semester/section filters.
 
-    query = """
+    ``teacher_name`` may be one name or a list of the same person's spellings
+    and initials (e.g. ["DR.SUSHMA B", "DR SUSHMA B", "SB"]), so classes from
+    every timetable are found however each timetable wrote the name.
+    """
+    names = (
+        [teacher_name] if isinstance(teacher_name, str) else list(teacher_name or [])
+    )
+    names = sorted({str(name).strip().lower() for name in names if str(name or "").strip()})
+    if not names:
+        return []
+    marks = ", ".join("?" for _ in names)
+
+    query = f"""
         SELECT entry.* FROM timetable_entries AS entry
         WHERE (
-            LOWER(entry.teacher_name) = LOWER(?)
+            LOWER(TRIM(entry.teacher_name)) IN ({marks})
             OR EXISTS (
                 SELECT 1
                 FROM entry_teachers AS association
                 WHERE association.entry_id = entry.id
                   AND (
-                    LOWER(association.teacher_name) = LOWER(?)
-                    OR LOWER(association.initials) = LOWER(?)
+                    LOWER(TRIM(association.teacher_name)) IN ({marks})
+                    OR LOWER(TRIM(association.initials)) IN ({marks})
                   )
             )
         )
           AND LOWER(entry.day) = LOWER(?)
     """
-    if not teacher_name or not str(teacher_name).strip():
-        return []
-    teacher = str(teacher_name).strip()
-    if not teacher:
-        return []
-    params = [teacher, teacher, teacher, day.strip()]
+    params = [*names, *names, *names, day.strip()]
 
     if semester is not None:
         query += " AND entry.semester = ?"
@@ -122,22 +173,11 @@ def find_room_at_time(room, day, time, include_needs_review=False):
     """Find which class uses a room at a particular time."""
     target = _to_minutes(time)
 
-    query = """
-        SELECT * FROM timetable_entries
-        WHERE LOWER(room) = LOWER(?)
-          AND LOWER(day) = LOWER(?)
-    """
-    if not include_needs_review:
-        query += " AND review_status = 'verified'"
-    query += " ORDER BY start_time"
-
-    with get_connection() as conn:
-        rows = conn.execute(query, (room.strip(), day.strip())).fetchall()
-
     return [
-        dict(row) for row in rows
-        if _to_minutes(row["start_time"]) <= target
-        < _to_minutes(row["end_time"])
+        entry
+        for entry in find_room_bookings(room, day, include_needs_review)
+        if _to_minutes(entry["start_time"]) <= target
+        < _to_minutes(entry["end_time"])
     ]
 
 
@@ -235,17 +275,22 @@ def detect_conflicts(day=None, include_needs_review=False):
 
             first_class = _identity_value(first.get("class_name"))
             second_class = _identity_value(second.get("class_name"))
+            types = {first.get("entry_type"), second.get("entry_type")}
+            students_choose = (
+                types <= CHOICE_TYPES or "lateral_entry" in types
+            )
             if (
                 first_class
                 and first_class == second_class
                 and _identity_value(first.get("subgroup"))
                 == _identity_value(second.get("subgroup"))
+                and not students_choose
             ):
                 reasons.append("class")
 
-            first_room = _identity_value(first.get("room"))
-            second_room = _identity_value(second.get("room"))
-            if first_room and first_room == second_room:
+            first_rooms = {room_key(r) for r in split_rooms(first.get("room"))}
+            second_rooms = {room_key(r) for r in split_rooms(second.get("room"))}
+            if first_rooms & second_rooms - {"", "none", "null", "unknown"}:
                 reasons.append("room")
 
             if reasons:
@@ -408,21 +453,7 @@ def find_room_free_slots(
     if day_start >= day_end:
         raise ValueError("Working start must be earlier than working end")
 
-    query = """
-        SELECT start_time, end_time
-        FROM timetable_entries
-        WHERE LOWER(room) = LOWER(?)
-          AND LOWER(day) = LOWER(?)
-    """
-    params = [room.strip(), day.strip()]
-
-    if not include_needs_review:
-        query += " AND review_status = 'verified'"
-
-    query += " ORDER BY start_time"
-
-    with get_connection() as conn:
-        rows = conn.execute(query, params).fetchall()
+    rows = find_room_bookings(room, day, include_needs_review)
 
     intervals = [
         (
@@ -634,7 +665,10 @@ def find_section_free_slots(
         FROM timetable_entries
         WHERE LOWER(class_name) = LOWER(?)
           AND LOWER(day) = LOWER(?)
+          AND COALESCE(entry_type, '') <> 'lateral_entry'
     """
+    # Lateral-entry sessions are for diploma students only, so the rest of
+    # the class is free then.
     params = [class_name.strip(), day.strip()]
 
     if semester is not None:

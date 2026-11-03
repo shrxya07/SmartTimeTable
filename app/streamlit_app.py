@@ -1,4 +1,6 @@
+import hashlib
 import json
+import re
 import sqlite3
 import sys
 import uuid
@@ -17,14 +19,22 @@ from app.genai_assistant import (
     AI_UNAVAILABLE_MESSAGE,
     create_chat_session,
     ask_timetable_assistant,
+    describe_gemini_error,
     gemini_vision_client,
     is_ai_available,
     list_known_timetable_data,
 )
 from app.ingestion.extraction_pipeline import run_extraction_pipeline
-from app.ingestion.timetable_validator import class_name_for
+from app.ingestion.timetable_validator import (
+    apply_faculty_directory,
+    class_name_for,
+    fill_initials_in_pending_reviews,
+)
+from app.ui import explorer_page, generator_page, manage_page
 from app.ingestion.vision_extractor import SUPPORTED_SUFFIXES
 from app.database.db import (
+    TEACHER_OPTIONAL_TYPES,
+    find_timetables_by_hash,
     get_all_entries,
     get_pending_reviews,
     initialize_database,
@@ -34,10 +44,14 @@ from app.database.db import (
     normalize_time,
     register_timetable,
     save_pending_review,
+    save_timetable_layout,
     update_timetable_metadata,
     update_timetable_status,
 )
-from app.database.retrieval import get_all_verified_entries
+from app.database.retrieval import (
+    get_all_verified_entries,
+    get_faculty_directory,
+)
 
 
 # ---------------- CONFIGURATION ----------------
@@ -116,6 +130,9 @@ page = st.sidebar.radio(
         "Chat Assistant",
         "Upload Timetable",
         "Review Extracted Records",
+        "Schedules & Conflicts",
+        "Generate Timetable",
+        "Manage Timetables",
     ],
 )
 
@@ -144,7 +161,10 @@ if page == "Chat Assistant":
         )
 
     # Example questions use names that exist in the approved data.
-    example_teacher = (known["teachers"] or ["the teacher"])[0]
+    example_teacher = next(
+        (name for name in known["teachers"] if "," not in name),
+        (known["teachers"] or ["the teacher"])[0],
+    )
     example_room = (known["rooms"] or ["the room"])[0]
     example_class = (known["classes"] or ["3A"])[0]
     examples = [
@@ -256,10 +276,28 @@ elif page == "Upload Timetable":
                 use_container_width=True,
             )
 
+        file_bytes = uploaded_file.getvalue()
+        file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+        try:
+            earlier_uploads = find_timetables_by_hash(file_sha256)
+        except sqlite3.Error:
+            earlier_uploads = []
+        extract_again = True
+        if earlier_uploads:
+            latest = earlier_uploads[0]
+            st.warning(
+                f"This exact file was already uploaded "
+                f"{len(earlier_uploads)} time(s), most recently on "
+                f"{latest['uploaded_at']} (status: {latest['status']}). "
+                "Its records are on the Review and Manage Timetables pages. "
+                "Extracting again uses Gemini quota and creates a second copy."
+            )
+            extract_again = st.checkbox("Extract it again anyway")
+
         if st.button(
             "Extract Timetable",
             type="primary",
-            disabled=not AI_AVAILABLE,
+            disabled=not AI_AVAILABLE or not extract_again,
         ):
 
             UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
@@ -285,7 +323,7 @@ elif page == "Upload Timetable":
             }
 
             try:
-                stored_path.write_bytes(uploaded_file.getvalue())
+                stored_path.write_bytes(file_bytes)
 
                 register_timetable(
                     timetable_id=timetable_id,
@@ -294,19 +332,38 @@ elif page == "Upload Timetable":
                     semester=semester,
                     section=section,
                     status="processing",
+                    file_sha256=file_sha256,
                 )
 
-                with st.spinner(
-                    "Reading the timetable with Gemini. This usually takes "
-                    "30-90 seconds per page..."
-                ):
+                progress_bar = st.progress(
+                    0.0,
+                    text="Reading the timetable with Gemini "
+                    "(about 20-40 seconds per page)...",
+                )
+
+                def show_progress(done, total):
+                    progress_bar.progress(
+                        done / total if total else 1.0,
+                        text=f"Read {done} of {total} page(s)...",
+                    )
+
+                with st.spinner("Extracting..."):
                     result = run_extraction_pipeline(
                         image_path=stored_path,
                         vision_client=gemini_vision_client,
+                        faculty_directory=get_faculty_directory(),
                         metadata=metadata,
+                        progress=show_progress,
                     )
+                progress_bar.empty()
 
                 header = result.get("header") or {}
+                save_timetable_layout(timetable_id, {
+                    "day_start": header.get("day_start"),
+                    "day_end": header.get("day_end"),
+                    "breaks": header.get("breaks") or [],
+                    "periods": header.get("periods") or [],
+                })
                 semester = semester or header.get("semester")
                 section = section or header.get("section")
                 class_name = class_name or header.get("class_name")
@@ -321,6 +378,20 @@ elif page == "Upload Timetable":
                         timetable_id,
                         result["course_offerings"],
                     )
+                    # This course table may define initials that earlier
+                    # timetables awaiting review left unresolved.
+                    refreshed = fill_initials_in_pending_reviews(
+                        get_pending_reviews(),
+                        get_faculty_directory(),
+                    )
+                    for other_id, payload, _ in refreshed:
+                        save_pending_review(other_id, payload)
+                    if refreshed:
+                        st.info(
+                            f"Also filled {sum(n for _, _, n in refreshed)} "
+                            "teacher initial(s) in "
+                            f"{len(refreshed)} other timetable(s) awaiting review."
+                        )
 
                 records = result.get("records", [])
 
@@ -409,7 +480,10 @@ elif page == "Upload Timetable":
                 except Exception:
                     pass
 
-                st.error(f"Timetable processing failed: {error}")
+                st.error(
+                    "Timetable processing failed: "
+                    f"{describe_gemini_error(error)}"
+                )
 
 
 # ============================================================
@@ -506,6 +580,61 @@ elif page == "Review Extracted Records":
                 "items above are retained for inspection."
             )
         else:
+            # Initials this timetable leaves undefined may be defined in
+            # another timetable of the department.
+            try:
+                directory = get_faculty_directory()
+            except sqlite3.Error:
+                directory = {}
+            fillable = sum(
+                1
+                for record in records
+                for teacher in record.get("teachers") or []
+                if isinstance(teacher, dict)
+                and not teacher.get("teacher_name")
+                and len(
+                    directory.get(
+                        re.sub(r"[^A-Z0-9]", "", str(teacher.get("initials") or "").upper()),
+                        {},
+                    ).get("names", [])
+                ) == 1
+            )
+            if fillable and st.button(
+                f"Fill {fillable} teacher initial(s) from other timetables",
+                help=(
+                    "Uses the course/faculty tables of the department's other "
+                    "timetables. Only initials that belong to exactly one "
+                    "person are filled; each shows where it came from."
+                ),
+                key=f"fill_initials_{timetable_id}_{st.session_state.get('review_editor_revision', 0)}",
+            ):
+                updated = [dict(record) for record in records]
+                for record in updated:
+                    record["teachers"] = [
+                        dict(teacher) if isinstance(teacher, dict) else teacher
+                        for teacher in record.get("teachers") or []
+                    ]
+                    record["unresolved_fields"] = dict(
+                        record.get("unresolved_fields") or {}
+                    )
+                    record["uncertainties"] = list(record.get("uncertainties") or [])
+                    record["directory_notes"] = list(record.get("directory_notes") or [])
+                filled = apply_faculty_directory(updated, directory)
+                st.session_state.review_records = updated
+                st.session_state.review_editor_revision = (
+                    st.session_state.get("review_editor_revision", 0) + 1
+                )
+                st.session_state.review_save_notice = (
+                    f"Filled {filled} teacher initial(s) from other timetables."
+                )
+                save_pending_review(timetable_id, {
+                    "records": updated,
+                    "unresolved_items": unresolved_items,
+                    "metadata": metadata,
+                    "message": extraction_result.get("message"),
+                })
+                st.rerun()
+
             st.write(
                 "Inspect the OCR evidence and correct entries before "
                 "selecting them. `auto` is a deterministic review tier, "
@@ -649,6 +778,10 @@ elif page == "Review Extracted Records":
                             if isinstance(reason, str)
                         ]
                         + list(record.get("uncertainties") or [])
+                        + [
+                            f"Filled in: {note}"
+                            for note in record.get("directory_notes") or []
+                        ]
                     ),
                 })
 
@@ -956,10 +1089,7 @@ elif page == "Review Extracted Records":
                     entry_type = str(
                         normalize_missing(entry.get("entry_type")) or "class"
                     ).casefold()
-                    optional_teacher_room = entry_type in {
-                        "activity",
-                        "break",
-                    }
+                    optional_teacher_room = entry_type in TEACHER_OPTIONAL_TYPES
                     missing = [
                         field
                         for field in (
@@ -1109,3 +1239,17 @@ elif page == "Review Extracted Records":
                 st.session_state.review_save_notice = " ".join(notices)
                 st.session_state.review_save_errors = errors
                 st.rerun()
+
+
+# ============================================================
+# PAGES 4-6: SCHEDULES, GENERATOR, MANAGEMENT
+# ============================================================
+
+elif page == "Schedules & Conflicts":
+    explorer_page.render()
+
+elif page == "Generate Timetable":
+    generator_page.render()
+
+elif page == "Manage Timetables":
+    manage_page.render()

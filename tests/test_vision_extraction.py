@@ -239,6 +239,30 @@ def test_class_name_without_semester_uses_group():
     assert result["records"][0]["start_time"] == "08:30"
 
 
+def test_day_layout_comes_from_period_header():
+    header = build_records(page(
+        [slot("Monday", "09:00", "09:55", "DS")],
+        periods=[
+            {"start_time": "9.00", "end_time": "9.55", "is_break": False},
+            {"start_time": "10.50", "end_time": "11.05", "is_break": True},
+            {"start_time": "12.55", "end_time": "1.45", "is_break": True},
+            {"start_time": "3.35", "end_time": "4.30", "is_break": False},
+        ],
+    ))["header"]
+    assert (header["day_start"], header["day_end"]) == ("09:00", "16:30")
+    assert header["breaks"] == [["10:50", "11:05"], ["12:55", "13:45"]]
+
+
+def test_day_layout_without_header_uses_slot_span_and_no_breaks():
+    header = build_records(page([
+        slot("Monday", "09:00", "09:55", "DS"),
+        slot("Monday", "13:45", "14:40", "DS"),
+    ]))["header"]
+    assert (header["day_start"], header["day_end"], header["breaks"]) == (
+        "09:00", "14:40", [],
+    )
+
+
 def test_course_offerings_flatten_section_assignments():
     offerings = build_records(page([]))["course_offerings"]
     assert {"faculty_name": "DR CHANDRIKA P", "section_label": "2",
@@ -396,3 +420,85 @@ def test_pending_review_survives_reload_and_clears_when_done(tmp_path, monkeypat
 
     db.save_pending_review("t1", {"records": [], "unresolved_items": []})
     assert db.get_pending_reviews() == []
+
+
+# ---------------- Special sessions and choice options ----------------
+
+def test_lateral_entry_and_open_elective_need_no_class_teacher():
+    records = build_records(page([
+        slot("Friday", "13:45", "16:30", "AM31 (Lateral Entry) AB 701 & AB702",
+             course_abbrev="AM31", room="AB 701 & AB702"),
+        slot("Monday", "13:45", "14:40", "OE", course_abbrev="OE", room=None,
+             entry_type="elective"),
+    ]))["records"]
+
+    lateral, open_elective = records
+    assert lateral["entry_type"] == "lateral_entry"
+    assert open_elective["entry_type"] == "open_elective"
+    assert all(r["review_tier"] == "auto" for r in records), [
+        (r["unresolved_fields"], r["uncertainties"]) for r in records
+    ]
+
+
+def test_elective_options_are_not_overlaps_and_whole_cell_duplicate_is_dropped():
+    cell = "AEC NOSQL/PE"
+    records = build_records(page([
+        slot("Thursday", "13:45", "14:40", cell, entry_type="elective",
+             course_abbrev="DS", teachers=[teacher("AKSHATHA KAMATH")]),
+        slot("Thursday", "13:45", "14:40", cell, entry_type="elective",
+             course_abbrev="DS", group="Section 1",
+             teachers=[teacher("AKSHATHA KAMATH")]),
+        slot("Thursday", "13:45", "14:40", cell, entry_type="elective",
+             course_abbrev="OOAD", group="Section 2",
+             teachers=[teacher("DR CHANDRIKA P")]),
+        # A different elective at an overlapping time: students choose.
+        slot("Thursday", "13:45", "15:35", "OOAD/BDA", entry_type="elective",
+             course_abbrev="OOAD", teachers=[teacher("DR SUSHMA B")]),
+    ]))["records"]
+
+    assert [r["subgroup"] for r in records] == ["Section 1", "Section 2", None]
+    assert not any(
+        str(u).startswith("Overlaps") for r in records for u in r["uncertainties"]
+    )
+
+
+def test_revalidate_applies_new_rules_to_old_pending_records():
+    from app.ingestion.timetable_validator import revalidate_records
+
+    old = build_records(page([
+        slot("Thursday", "13:45", "14:40", "AEC NOSQL/PE", entry_type="elective",
+             course_abbrev="DS", teachers=[teacher("AKSHATHA KAMATH")]),
+        slot("Thursday", "13:45", "14:40", "AEC NOSQL/PE", entry_type="elective",
+             course_abbrev="DS", group="Section 1",
+             teachers=[teacher("AKSHATHA KAMATH")]),
+        slot("Thursday", "13:45", "14:40", "AEC NOSQL/PE", entry_type="elective",
+             course_abbrev="OOAD", group="Section 2",
+             teachers=[teacher("DR CHANDRIKA P")]),
+    ]))["records"]
+    # Simulate a record saved under the old rules.
+    stale = dict(old[0])
+    stale.update({
+        "subgroup": None, "entry_type": "class", "original_text": "AM31 (Lateral Entry)",
+        "teacher_name": None, "teachers": [],
+        "unresolved_fields": {"teacher_name": "No teacher found for this class"},
+        "uncertainties": ["Course not found in the page's course table",
+                          "Overlaps 'X' (13:45-14:40)"],
+    })
+
+    checked = revalidate_records([stale, *old])
+    lateral = checked[0]
+    assert lateral["entry_type"] == "lateral_entry"
+    assert lateral["review_tier"] == "auto"
+    assert len(checked) == 3
+
+
+def test_teacherless_special_sessions_can_be_saved(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "special.db")
+    db.initialize_database()
+    for entry_type in ("lateral_entry", "open_elective"):
+        db.insert_entry({
+            "subject": entry_type, "class_name": "3A", "day": "Monday",
+            "start_time": "13:45", "end_time": "14:40", "entry_type": entry_type,
+            "review_status": "verified", "timetable_id": "t",
+        })
+    assert len(db.get_all_entries()) == 2

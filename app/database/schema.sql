@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS timetables (
 
     status TEXT NOT NULL DEFAULT 'uploaded',
 
+    file_sha256 TEXT,
+    layout_json TEXT,
+
     uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
@@ -94,6 +97,13 @@ CREATE TABLE IF NOT EXISTS timetable_courses (
     faculty_initials TEXT,
     room TEXT,
     source_bbox TEXT
+);
+
+-- Spellings a person confirmed are the same teacher ("MAMTHA A" -> "MAMATHA A").
+CREATE TABLE IF NOT EXISTS teacher_aliases (
+    alias_key TEXT PRIMARY KEY,
+    canonical_name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Extracted records awaiting review, kept so a restart does not lose them.

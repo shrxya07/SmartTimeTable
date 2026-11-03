@@ -9,14 +9,21 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+import httpx
 
-from app.database.db import initialize_database
+from app.database.db import get_teacher_aliases, initialize_database, person_key
 from app.database.retrieval import (
+    get_day_layout,
+    get_faculty_directory,
     get_verified_classes,
     get_verified_rooms,
     get_verified_teacher_identities,
 )
-from app.ingestion.timetable_validator import normalize_clock, normalize_day
+from app.ingestion.timetable_validator import (
+    DAY_NAMES,
+    normalize_clock,
+    normalize_day,
+)
 
 from app.scheduling.engine import (
     find_teacher_schedule,
@@ -24,6 +31,7 @@ from app.scheduling.engine import (
     find_class_schedule,
     find_room_at_time,
     find_free_slots,
+    find_room_bookings,
     find_room_free_slots,
     find_section_free_slots,
     detect_conflicts,
@@ -40,6 +48,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # Extraction needs the stronger model: flash-lite mis-read merged cells.
 VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash")
+# "minimal" thinking matched full accuracy on the sample timetables in
+# about half the time. Set GEMINI_VISION_THINKING= (empty) for the default.
+VISION_THINKING_LEVEL = os.getenv("GEMINI_VISION_THINKING", "minimal") or None
 
 AI_UNAVAILABLE_MESSAGE = (
     "AI features are disabled because GEMINI_API_KEY is not configured. "
@@ -83,16 +94,68 @@ def get_client():
 # 2. Gemini API retry helper
 # --------------------------------------------------
 
+MAX_RETRY_WAIT_SECONDS = 65
+
+
+class GeminiQuotaError(RuntimeError):
+    """The Gemini quota is used up and waiting a minute will not help."""
+
+
+def _retry_wait_seconds(error, attempt):
+    """Use the delay Gemini asks for (e.g. 'retry in 31s'), else back off."""
+    match = re.search(
+        r"retry(?:Delay['\"]?:\s*['\"]| in )(\d+(?:\.\d+)?)s",
+        str(error),
+    )
+    if match:
+        return min(float(match.group(1)) + 1, MAX_RETRY_WAIT_SECONDS)
+    return min(2 ** attempt, MAX_RETRY_WAIT_SECONDS)
+
+
+def _is_daily_quota(error):
+    return error.code == 429 and "PerDay" in str(error)
+
+
+# A dropped connection or failed DNS lookup is worth retrying.
+NETWORK_ERRORS = (httpx.TransportError, ConnectionError)
+
+
+def describe_gemini_error(error):
+    """A short message for the UI instead of a raw API error dump."""
+    if isinstance(error, GeminiQuotaError):
+        return str(error)
+    if isinstance(error, APIError):
+        if error.code == 429:
+            return (
+                "Gemini's rate limit was reached (the free tier allows a few "
+                "requests per minute). Wait a minute and try again."
+            )
+        if error.code in (500, 502, 503, 504):
+            return "Gemini is temporarily unavailable. Try again shortly."
+        if error.code in (401, 403):
+            return "Gemini rejected the API key. Check GEMINI_API_KEY in .env."
+        return f"Gemini request failed (HTTP {error.code})."
+    if isinstance(error, NETWORK_ERRORS):
+        return (
+            "Couldn't reach Gemini. Check the internet connection and "
+            "try again."
+        )
+    return str(error)
+
+
 def generate_content_with_retry(
     contents,
     config,
-    max_attempts=3,
+    max_attempts=5,
     model=None,
 ):
     """
     Call Gemini and retry temporary API failures.
 
-    Retries HTTP 429, 500, 502, 503 and 504 errors.
+    Retries HTTP 429, 500, 502, 503 and 504 errors, waiting as long as a
+    rate-limit response asks (the free tier allows ~5 requests a minute),
+    and brief network drops. A used-up daily quota is raised at once as
+    GeminiQuotaError.
     """
 
     retryable_codes = (429, 500, 502, 503, 504)
@@ -119,7 +182,26 @@ def generate_content_with_retry(
             print("Gemini request successful.")
             return response
 
+        except NETWORK_ERRORS as error:
+
+            if attempt == max_attempts:
+                print("Gemini unreachable; retry limit reached.")
+                raise
+
+            wait_seconds = min(2 ** attempt, MAX_RETRY_WAIT_SECONDS)
+            print(
+                f"Network error reaching Gemini ({error!r}). "
+                f"Retrying in {wait_seconds} seconds..."
+            )
+            time.sleep(wait_seconds)
+
         except APIError as error:
+
+            if _is_daily_quota(error):
+                raise GeminiQuotaError(
+                    "Gemini's daily free quota for this API key is used up. "
+                    "Try again tomorrow or use a key with billing enabled."
+                ) from error
 
             if error.code not in retryable_codes:
                 raise
@@ -128,7 +210,7 @@ def generate_content_with_retry(
                 print("Gemini retry limit reached.")
                 raise
 
-            wait_seconds = 2 ** attempt
+            wait_seconds = _retry_wait_seconds(error, attempt)
 
             print(
                 f"Gemini temporarily unavailable "
@@ -167,6 +249,11 @@ def gemini_vision_client(
             temperature=0,
             response_mime_type="application/json",
             response_schema=response_schema,
+            thinking_config=(
+                types.ThinkingConfig(thinking_level=VISION_THINKING_LEVEL)
+                if VISION_THINKING_LEVEL
+                else None
+            ),
         ),
         model=VISION_MODEL,
     )
@@ -203,19 +290,61 @@ def resolve_teacher_name(teacher_name: str):
 
     # Includes co-teachers from entry_teachers; NULL names are excluded.
     identities = get_verified_teacher_identities()
-    exact = sorted({
-        identity["teacher_name"]
-        for identity in identities
-        if query == _name_key(identity["teacher_name"])
-        or query == _compact(identity["initials"])
-    })
-    matches = exact or sorted({
-        identity["teacher_name"]
-        for identity in identities
-        if query in _name_key(identity["teacher_name"])
-    })
+    directory = get_faculty_directory()
+    aliases_map = get_teacher_aliases()
 
-    if not matches:
+    def person_of(name):
+        # Confirmed same-teacher spellings map to one canonical name.
+        return _name_key(aliases_map.get(person_key(name), name))
+
+    # One person per name key: "DR.SUSHMA B" and "Dr Sushma B" are the same
+    # teacher written differently in two timetables.
+    initials_by_person = {}
+    for identity in identities:
+        if identity["initials"]:
+            initials_by_person.setdefault(
+                person_of(identity["teacher_name"]), set()
+            ).add(_compact(identity["initials"]))
+    for initials, entry in directory.items():
+        if len(entry["names"]) == 1:
+            initials_by_person.setdefault(
+                person_of(entry["names"][0]), set()
+            ).add(_compact(initials))
+
+    exact = {
+        person_of(identity["teacher_name"])
+        for identity in identities
+        if query == person_of(identity["teacher_name"])
+        or query == _compact(identity["initials"])
+    } | {
+        person for person, initials in initials_by_person.items()
+        if query in initials
+    }
+    people = exact or {
+        person_of(identity["teacher_name"])
+        for identity in identities
+        if query in person_of(identity["teacher_name"])
+    }
+    # A name that is itself someone's initials ("SB") is that person.
+    people = {
+        next(
+            (person for person, initials in initials_by_person.items()
+             if key in initials and person != key),
+            key,
+        )
+        for key in people
+    }
+
+    spellings = {
+        person: sorted({
+            identity["teacher_name"] for identity in identities
+            if person_of(identity["teacher_name"]) == person
+        })
+        for person in people
+    }
+    spellings = {person: names for person, names in spellings.items() if names}
+
+    if not spellings:
         return {
             "error": (
                 f"No verified timetable records found "
@@ -223,14 +352,24 @@ def resolve_teacher_name(teacher_name: str):
             )
         }
 
-    if len(matches) > 1:
+    if len(spellings) > 1:
         return {
             "error": "Multiple teachers match your query.",
-            "matching_teachers": matches,
+            "matching_teachers": sorted(names[0] for names in spellings.values()),
             "instruction": "Ask the user to specify the teacher."
         }
 
-    return {"teacher_name": matches[0]}
+    person, names = next(iter(spellings.items()))
+    initials = initials_by_person.get(person, set())
+    aliases = set(names) | {
+        identity["teacher_name"] for identity in identities
+        if _compact(identity["teacher_name"]) in initials
+    } | {value.upper() for value in initials}
+    canonical = aliases_map.get(person_key(names[0]))
+    return {
+        "teacher_name": canonical or max(names, key=len),
+        "aliases": sorted(aliases),
+    }
 
 
 def resolve_room(room: str):
@@ -238,19 +377,23 @@ def resolve_room(room: str):
     if not room or not room.strip():
         return {"error": "Please provide a room name."}
     query = _compact(room)
-    rooms = get_verified_rooms()
-    matches = [name for name in rooms if _compact(name) == query] or [
-        name for name in rooms if query in _compact(name)
+    # One room per key: "CSE LAB1" and "CSE LAB 1" are the same lab.
+    spellings = {}
+    for name in get_verified_rooms():
+        spellings.setdefault(_compact(name), set()).add(name)
+    keys = [key for key in spellings if key == query] or [
+        key for key in spellings if query in key
     ]
-    if not matches:
+    if not keys:
         return {"error": f"No verified timetable records use room {room}."}
-    if len(matches) > 1:
+    if len(keys) > 1:
         return {
             "error": "Multiple rooms match your query.",
-            "matching_rooms": matches,
+            "matching_rooms": sorted(max(spellings[key], key=len) for key in keys),
             "instruction": "Ask the user to specify the room.",
         }
-    return {"room": matches[0]}
+    names = sorted(spellings[keys[0]])
+    return {"room": max(names, key=len), "aliases": names}
 
 
 def resolve_class(class_name=None, semester=None, section=None):
@@ -298,6 +441,21 @@ def _check_day_time(day, time_value=None):
     return normalized_day, normalized_time, None
 
 
+def _free_time_layout(day, class_name=None):
+    """Working hours and breaks for free-slot tools, or a note when the
+    approved data has nothing on that day (unknown is not "free")."""
+    layout = get_day_layout(day, class_name)
+    if layout is None:
+        return {
+            "note": (
+                f"No approved timetable records on {day}"
+                + (f" for class {class_name}" if class_name else "")
+                + ", so free time cannot be determined."
+            )
+        }
+    return layout
+
+
 # --------------------------------------------------
 # 5. Real database-backed Gemini tools
 # --------------------------------------------------
@@ -318,7 +476,7 @@ def get_teacher_schedule(
         return error
 
     return find_teacher_schedule(
-        resolved["teacher_name"],
+        resolved["aliases"],
         day,
         semester=semester,
         section=section
@@ -340,7 +498,7 @@ def get_teacher_location(
         return error
 
     return find_teacher_at_time(
-        resolved["teacher_name"],
+        resolved["aliases"],
         day,
         time
     )
@@ -372,7 +530,7 @@ def get_class_free_slots(
     class_name: str = None,
     semester: int = None,
     section: str = None,
-    min_duration_minutes: int = 50,
+    min_duration_minutes: int = 30,
 ):
     """Find periods when a class has nothing scheduled in verified records."""
 
@@ -383,11 +541,40 @@ def get_class_free_slots(
     if "error" in resolved:
         return resolved
 
-    return find_section_free_slots(
-        resolved["class_name"],
-        day,
-        min_duration_minutes=min_duration_minutes,
-    )
+    layout = _free_time_layout(day, resolved["class_name"])
+    if "note" in layout:
+        return layout
+    lateral = [
+        entry for entry in find_class_schedule(
+            class_name=resolved["class_name"], day=day,
+        )
+        if entry.get("entry_type") == "lateral_entry"
+    ]
+    result = {
+        "class_name": resolved["class_name"],
+        "day": day,
+        "free_periods": find_section_free_slots(
+            resolved["class_name"],
+            day,
+            min_duration_minutes=min_duration_minutes,
+            **layout,
+        ),
+    }
+    if lateral:
+        result["lateral_entry_sessions"] = [
+            {
+                "start_time": entry["start_time"],
+                "end_time": entry["end_time"],
+                "subject": entry.get("subject"),
+                "room": entry.get("room"),
+            }
+            for entry in lateral
+        ]
+        result["note"] = (
+            "Lateral-entry sessions are only for diploma (lateral-entry) "
+            "students, so the rest of the class is free then."
+        )
+    return result
 
 
 def get_room_schedule(
@@ -404,15 +591,16 @@ def get_room_schedule(
     if error:
         return error
 
-    return find_room_at_time(resolved["room"], day, time)
+    return find_room_at_time(resolved["aliases"], day, time)
 
 
 def get_room_free_slots(
     room: str,
     day: str,
-    min_duration_minutes: int = 50,
+    min_duration_minutes: int = 30,
 ):
-    """Find periods when a room is not used in verified records."""
+    """Find when a room or lab is free on a day, checked against every
+    class that uses it in all approved timetables."""
 
     resolved = resolve_room(room)
     if "error" in resolved:
@@ -420,22 +608,54 @@ def get_room_free_slots(
     day, _, error = _check_day_time(day)
     if error:
         return error
+    layout = _free_time_layout(day)
+    if "note" in layout:
+        return layout
 
-    return find_room_free_slots(
-        resolved["room"],
-        day,
-        min_duration_minutes=min_duration_minutes,
-    )
+    aliases = resolved["aliases"]
+    busy = find_room_bookings(aliases, day)
+    week_classes = sorted({
+        entry["class_name"]
+        for other_day in DAY_NAMES
+        for entry in find_room_bookings(aliases, other_day)
+        if entry.get("class_name")
+    })
+    return {
+        "room": resolved["room"],
+        "day": day,
+        "free_periods": find_room_free_slots(
+            aliases,
+            day,
+            min_duration_minutes=min_duration_minutes,
+            **layout,
+        ),
+        "busy_periods": [
+            {
+                "start_time": entry["start_time"],
+                "end_time": entry["end_time"],
+                "class_name": entry.get("class_name"),
+                "subject": entry.get("subject"),
+                "teacher": entry.get("teacher_name"),
+                "group": entry.get("subgroup"),
+            }
+            for entry in busy
+        ],
+        "classes_checked": week_classes,
+        "note": (
+            "Checked against every approved timetable that uses this room. "
+            "Classes whose timetables are not uploaded or approved yet are "
+            "not included."
+        ),
+    }
 
 
 def get_teacher_free_slots(
     teacher_name: str,
     day: str,
-    min_duration_minutes: int = 60,
-    semester: int = None,
-    section: str = None
+    min_duration_minutes: int = 30,
 ):
-    """Find verified free periods in a teacher's schedule."""
+    """Find when a teacher is free on a day, checked against every class
+    they teach in all approved timetables (not just one class)."""
 
     resolved = resolve_teacher_name(teacher_name)
     if "error" in resolved:
@@ -443,14 +663,44 @@ def get_teacher_free_slots(
     day, _, error = _check_day_time(day)
     if error:
         return error
+    layout = _free_time_layout(day)
+    if "note" in layout:
+        return layout
 
-    return find_free_slots(
-        resolved["teacher_name"],
-        day,
-        min_duration_minutes=min_duration_minutes,
-        semester=semester,
-        section=section
-    )
+    aliases = resolved["aliases"]
+    busy = find_teacher_schedule(aliases, day)
+    week_classes = sorted({
+        entry["class_name"]
+        for other_day in DAY_NAMES
+        for entry in find_teacher_schedule(aliases, other_day)
+        if entry.get("class_name")
+    })
+    return {
+        "teacher": resolved["teacher_name"],
+        "day": day,
+        "free_periods": find_free_slots(
+            aliases,
+            day,
+            min_duration_minutes=min_duration_minutes,
+            **layout,
+        ),
+        "busy_periods": [
+            {
+                "start_time": entry["start_time"],
+                "end_time": entry["end_time"],
+                "class_name": entry.get("class_name"),
+                "subject": entry.get("subject"),
+                "room": entry.get("room"),
+            }
+            for entry in sorted(busy, key=lambda item: item["start_time"])
+        ],
+        "classes_checked": week_classes,
+        "note": (
+            "Checked against every approved timetable this teacher appears "
+            "in. Classes whose timetables are not uploaded or approved yet "
+            "are not included."
+        ),
+    }
 
 
 def get_timetable_conflicts(day: str = None):
@@ -466,12 +716,22 @@ def get_timetable_conflicts(day: str = None):
 def list_known_timetable_data():
     """List the teachers, rooms and classes that have verified records."""
 
+    # One entry per person, even when timetables spell the name differently.
+    aliases_map = get_teacher_aliases()
+    people = {}
+    for identity in get_verified_teacher_identities():
+        name = aliases_map.get(
+            person_key(identity["teacher_name"]), identity["teacher_name"]
+        )
+        key = _name_key(name)
+        if len(name) > len(people.get(key, "")):
+            people[key] = name
     return {
-        "teachers": sorted({
-            identity["teacher_name"]
-            for identity in get_verified_teacher_identities()
-        }),
-        "rooms": get_verified_rooms(),
+        "teachers": sorted(people.values()),
+        "rooms": sorted({
+            _compact(name): name
+            for name in sorted(get_verified_rooms(), key=len)
+        }.values()),
         "classes": [item["class_name"] for item in get_verified_classes()],
     }
 
@@ -518,6 +778,9 @@ IMPORTANT RULES:
    ask the user for clarification.
 6. If no matching timetable record is found, say so clearly.
 7. Do not calculate free slots yourself. Use the scheduling tool.
+   A teacher's or room's free time is checked across all classes that
+   use it; mention which classes were checked (classes_checked) and what
+   it is busy with (busy_periods) when you answer.
 8. Respect semester and section filters when provided.
 9. Explain results in simple, understandable language.
 10. Do not claim a teacher is physically present at a location.
@@ -592,8 +855,8 @@ def ask_timetable_assistant(question: str, chat_session) -> str:
         print(f"Gemini error after {elapsed:.2f} seconds:", repr(error))
 
         return (
-            "Sorry, I encountered an error while checking "
-            "the timetable. Please try again."
+            "Sorry, I couldn't check the timetable: "
+            f"{describe_gemini_error(error)}"
         )
 
 

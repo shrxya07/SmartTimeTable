@@ -428,3 +428,21 @@ def test_unverified_records_excluded_by_default(test_database):
     assert slots == [
         {"start_time": "09:00", "end_time": "11:00", "duration_minutes": 120}
     ]
+
+
+def test_elective_options_and_lateral_entry_are_not_class_clashes(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "clash.db")
+    db.initialize_database()
+    for subject, entry_type, teacher, room in (
+        ("NOSQL", "elective", "A", "LHC 301"),
+        ("PE", "elective", "B", "CSE LAB 3"),
+        ("AM31", "lateral_entry", None, "AB 701"),
+    ):
+        db.insert_entry({
+            "subject": subject, "teacher_name": teacher, "class_name": "5B",
+            "day": "Thursday", "start_time": "13:45", "end_time": "14:40",
+            "room": room, "entry_type": entry_type, "review_status": "verified",
+            "timetable_id": "t5b",
+        })
+    from app.scheduling.engine import detect_conflicts
+    assert detect_conflicts(day="Thursday") == []

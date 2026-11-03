@@ -5,7 +5,7 @@ cross-check -> ``timetable_validator.build_records``. No record is approved
 here; everything is returned with ``review_status = needs_review``.
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import tempfile
 
@@ -41,16 +41,22 @@ def _ocr_text(image_bytes, mime_type, tesseract_cmd):
 
 
 def _extract_one(page, vision_client, metadata, source_document,
-                 tesseract_cmd, ocr_check):
+                 tesseract_cmd, ocr_check, faculty_directory):
     page_number, image_bytes, mime_type = page
-    extracted = extract_page(image_bytes, mime_type, vision_client)
-    ocr_text = (
-        _ocr_text(image_bytes, mime_type, tesseract_cmd) if ocr_check else None
-    )
+    # OCR runs locally while the vision request waits on the network.
+    with ThreadPoolExecutor(max_workers=1) as ocr_pool:
+        ocr_future = (
+            ocr_pool.submit(_ocr_text, image_bytes, mime_type, tesseract_cmd)
+            if ocr_check
+            else None
+        )
+        extracted = extract_page(image_bytes, mime_type, vision_client)
+        ocr_text = ocr_future.result() if ocr_future else None
     result = build_records(
         extracted,
         metadata=metadata,
         ocr_text=ocr_text,
+        faculty_directory=faculty_directory,
         source_document=source_document,
         source_page=page_number,
     )
@@ -64,12 +70,17 @@ def run_extraction_pipeline(
     metadata=None,
     tesseract_cmd=None,
     ocr_check=True,
+    progress=None,
+    faculty_directory=None,
 ):
     """Extract an image or PDF timetable without approving any records.
 
     ``vision_client(image_bytes, mime_type, prompt, response_schema)`` is the
     injected vision model. When it is None (no API key), nothing is extracted
-    and the result says why.
+    and the result says why. ``progress(pages_done, page_count)``, if given,
+    is called as each page finishes. ``faculty_directory`` (initials -> names
+    from the department's other timetables) fills initials this page's own
+    course table does not define.
     """
     metadata = dict(metadata or {})
     source_path = Path(image_path)
@@ -100,14 +111,20 @@ def run_extraction_pipeline(
             ),
         }
 
+    if progress:
+        progress(0, len(pages))
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL_PAGES) as pool:
-        page_results = list(pool.map(
-            lambda page: _extract_one(
-                page, vision_client, metadata, source_document,
-                tesseract_cmd, ocr_check,
-            ),
-            pages,
-        ))
+        futures = [
+            pool.submit(
+                _extract_one, page, vision_client, metadata,
+                source_document, tesseract_cmd, ocr_check, faculty_directory,
+            )
+            for page in pages
+        ]
+        for done, _ in enumerate(as_completed(futures), start=1):
+            if progress:
+                progress(done, len(pages))
+        page_results = [future.result() for future in futures]
 
     records = [r for page in page_results for r in page["records"]]
     header = next(
