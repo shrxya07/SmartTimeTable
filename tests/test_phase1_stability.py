@@ -122,6 +122,34 @@ def test_ai_features_are_disabled_without_api_key(monkeypatch):
         genai_assistant.get_client()
 
 
+def test_network_drops_are_retried_then_explained(monkeypatch):
+    import httpx
+
+    calls = []
+
+    class FlakyModels:
+        def generate_content(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                raise httpx.ConnectError("getaddrinfo failed")
+            return type("Response", (), {"text": "{}"})()
+
+    class FakeClient:
+        models = FlakyModels()
+
+    monkeypatch.setattr(genai_assistant, "get_client", lambda: FakeClient())
+    monkeypatch.setattr(genai_assistant.time, "sleep", lambda seconds: None)
+
+    assert genai_assistant.generate_content_with_retry("hi", None).text == "{}"
+    assert len(calls) == 3
+
+    message = genai_assistant.describe_gemini_error(httpx.ConnectError("down"))
+    assert "internet connection" in message
+    assert "internet connection" in genai_assistant.describe_gemini_error(
+        ConnectionResetError(10054, "forcibly closed")
+    )
+
+
 @pytest.mark.parametrize(
     ("api_key", "expect_warning"),
     [("", True), ("placeholder-key-for-startup-test", False)],

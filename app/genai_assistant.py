@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+import httpx
 
 from app.database.db import initialize_database
 from app.database.retrieval import (
@@ -115,6 +116,10 @@ def _is_daily_quota(error):
     return error.code == 429 and "PerDay" in str(error)
 
 
+# A dropped connection or failed DNS lookup is worth retrying.
+NETWORK_ERRORS = (httpx.TransportError, ConnectionError)
+
+
 def describe_gemini_error(error):
     """A short message for the UI instead of a raw API error dump."""
     if isinstance(error, GeminiQuotaError):
@@ -130,6 +135,11 @@ def describe_gemini_error(error):
         if error.code in (401, 403):
             return "Gemini rejected the API key. Check GEMINI_API_KEY in .env."
         return f"Gemini request failed (HTTP {error.code})."
+    if isinstance(error, NETWORK_ERRORS):
+        return (
+            "Couldn't reach Gemini. Check the internet connection and "
+            "try again."
+        )
     return str(error)
 
 
@@ -143,8 +153,9 @@ def generate_content_with_retry(
     Call Gemini and retry temporary API failures.
 
     Retries HTTP 429, 500, 502, 503 and 504 errors, waiting as long as a
-    rate-limit response asks (the free tier allows ~5 requests a minute).
-    A used-up daily quota is raised at once as GeminiQuotaError.
+    rate-limit response asks (the free tier allows ~5 requests a minute),
+    and brief network drops. A used-up daily quota is raised at once as
+    GeminiQuotaError.
     """
 
     retryable_codes = (429, 500, 502, 503, 504)
@@ -170,6 +181,19 @@ def generate_content_with_retry(
 
             print("Gemini request successful.")
             return response
+
+        except NETWORK_ERRORS as error:
+
+            if attempt == max_attempts:
+                print("Gemini unreachable; retry limit reached.")
+                raise
+
+            wait_seconds = min(2 ** attempt, MAX_RETRY_WAIT_SECONDS)
+            print(
+                f"Network error reaching Gemini ({error!r}). "
+                f"Retrying in {wait_seconds} seconds..."
+            )
+            time.sleep(wait_seconds)
 
         except APIError as error:
 
