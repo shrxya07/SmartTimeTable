@@ -2,7 +2,12 @@
 import json
 import re
 
-from app.database.db import get_connection, get_teacher_aliases, person_key
+from app.database.db import (
+    get_connection,
+    get_pending_reviews,
+    get_teacher_aliases,
+    person_key,
+)
 
 
 def search_entries(
@@ -436,3 +441,164 @@ def get_teacher_schedule_summary(teacher_name, day=None):
         "needs_review_count": len(pending),
         "has_unverified_data": bool(pending),
     }
+
+
+# A cropped, re-saved or PDF copy of a timetable has different file bytes but
+# the same sessions, so compare what was extracted instead of the file.
+SIMILAR_MIN_SHARED = 4
+SIMILAR_MIN_SCORE = 0.8
+
+
+_COURSE_FILLER = {"and", "of", "the", "for", "in", "to", "with"}
+_COURSE_KIND = {"lab", "laboratory", "labs", "tut", "tutorial", "theory", "practical"}
+
+
+def _course_variants(record):
+    """Ways one course may be written: "DMS", "DMS TUT" and "Discrete
+    Mathematical Structures" all give "dms"."""
+    variants = set()
+    for field in ("course_abbrev", "subject", "course", "course_name"):
+        words = re.findall(r"[a-z0-9]+", str(record.get(field) or "").casefold())
+        core = [word for word in words if word not in _COURSE_KIND]
+        if not core:
+            continue
+        variants.add("".join(core))
+        initials = "".join(word[0] for word in core if word not in _COURSE_FILLER)
+        if len(initials) >= 2:
+            variants.add(initials)
+    return variants
+
+
+def _same_course(first, second):
+    return any(
+        a == b or (min(len(a), len(b)) >= 3 and (a.startswith(b) or b.startswith(a)))
+        for a in first
+        for b in second
+    )
+
+
+def _session_key(record):
+    day = str(record.get("day") or "").strip().casefold()
+    try:
+        start = _minutes(record.get("start_time"))
+        end = _minutes(record.get("end_time"))
+    except (TypeError, ValueError):
+        return None
+    if not day:
+        return None
+    return day, start, end
+
+
+def _class_key(record_or_name):
+    """'3A', 'CSE 3A' and 'Semester 3 Section A' all give '3a'."""
+    if isinstance(record_or_name, dict):
+        semester = str(record_or_name.get("semester") or "").strip()
+        section = str(record_or_name.get("section") or "").strip()
+        if semester and section:
+            return f"{semester}{section}".casefold()
+        record_or_name = record_or_name.get("class_name")
+    words = re.findall(r"[a-z0-9]+", str(record_or_name or "").casefold())
+    words = [
+        word for word in words
+        if word not in {"semester", "sem", "section", "sec", "cse", "class"}
+    ]
+    return "".join(words) or None
+
+
+def _class_of(records, fallback=None):
+    names = [key for key in map(_class_key, records) if key]
+    if names:
+        return max(set(names), key=names.count)
+    return _class_key(fallback)
+
+
+def _sessions(records):
+    """{(day, start, end): [course variants, ...]} for the records."""
+    sessions = {}
+    for record in records:
+        key = _session_key(record)
+        if key:
+            sessions.setdefault(key, []).append(_course_variants(record))
+    return sessions
+
+
+def _shared_sessions(new, other):
+    """Time slots present in both with a matching course (or no course)."""
+    shared = 0
+    for key, courses in new.items():
+        if key not in other:
+            continue
+        if any(
+            not first or not second or _same_course(first, second)
+            for first in courses
+            for second in other[key]
+        ):
+            shared += 1
+    return shared
+
+
+def find_similar_timetables(records, class_name=None, exclude_timetable_id=None):
+    """Earlier timetables whose sessions match these extracted records.
+
+    Matches on day, times and course, so a cropped copy (a subset of the
+    sessions), a screenshot or a PDF of the same timetable is still found.
+    Approved and pending records are both compared.
+    """
+    new_sessions = _sessions(records)
+    if len(new_sessions) < SIMILAR_MIN_SHARED:
+        return []
+    new_class = _class_of(records, class_name)
+
+    others = {}
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT entry.timetable_id, entry.day, entry.start_time,
+                   entry.end_time, entry.course_abbrev, entry.subject,
+                   entry.class_name, timetable.original_filename
+            FROM timetable_entries AS entry
+            JOIN timetables AS timetable
+              ON timetable.timetable_id = entry.timetable_id
+            """
+        ).fetchall()
+    for row in rows:
+        item = others.setdefault(
+            row["timetable_id"],
+            {"original_filename": row["original_filename"], "records": []},
+        )
+        item["records"].append(dict(row))
+
+    for review in get_pending_reviews():
+        item = others.setdefault(
+            review["timetable_id"],
+            {"original_filename": review["original_filename"], "records": []},
+        )
+        item["records"].extend(review["payload"].get("records") or [])
+        item.setdefault(
+            "class_name", (review["payload"].get("metadata") or {}).get("class_name")
+        )
+
+    matches = []
+    for timetable_id, item in others.items():
+        if timetable_id == exclude_timetable_id:
+            continue
+        other_class = _class_of(item["records"], item.get("class_name"))
+        if new_class and other_class and new_class != other_class:
+            continue
+        sessions = _sessions(item["records"])
+        if not sessions:
+            continue
+        shared = _shared_sessions(new_sessions, sessions)
+        if shared < SIMILAR_MIN_SHARED:
+            continue
+        score = shared / min(len(new_sessions), len(sessions))
+        if score >= SIMILAR_MIN_SCORE:
+            matches.append({
+                "timetable_id": timetable_id,
+                "original_filename": item["original_filename"],
+                "shared_sessions": shared,
+                "new_sessions": len(new_sessions),
+                "other_sessions": len(sessions),
+                "score": round(score, 2),
+            })
+    return sorted(matches, key=lambda match: match["score"], reverse=True)

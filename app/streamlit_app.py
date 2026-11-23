@@ -49,6 +49,7 @@ from app.database.db import (
     update_timetable_status,
 )
 from app.database.retrieval import (
+    find_similar_timetables,
     get_all_verified_entries,
     get_faculty_directory,
 )
@@ -468,6 +469,26 @@ elif page == "Upload Timetable":
 
                 if result.get("message"):
                     st.warning(result["message"])
+
+                # A cropped or re-saved copy has a new file hash, so compare
+                # the extracted sessions with earlier timetables too.
+                try:
+                    similar = find_similar_timetables(
+                        records,
+                        class_name=class_name,
+                        exclude_timetable_id=timetable_id,
+                    )
+                except sqlite3.Error:
+                    similar = []
+                for match in similar[:3]:
+                    st.warning(
+                        "This looks like the same timetable as "
+                        f"'{match['original_filename']}': "
+                        f"{match['shared_sessions']} of "
+                        f"{match['new_sessions']} sessions match. It may be a "
+                        "cropped, screenshot or PDF copy. If so, approve only "
+                        "one and delete the other on Manage Timetables."
+                    )
 
                 st.info(
                     "Go to 'Review Extracted Records' to inspect "
