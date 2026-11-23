@@ -30,14 +30,6 @@ Upload ─► Gemini vision reads each page into structured JSON
    database tools (`app/scheduling/engine.py`, `app/database/retrieval.py`).
    Names, initials, rooms and class names are matched loosely ("Dr. Rao",
    "lhc301", "CSE 3A"); free time skips breaks and uses each day's real hours.
-5. **Generation** (`app/scheduling/generator.py`): builds a clash-free week
-   for a class with a backtracking constraint solver. Hard constraints: no
-   class, teacher or room double-booked (including against other classes'
-   approved timetables), labs on consecutive periods that never cross a
-   break, parallel sections/batches kept together, fixed activities and
-   short days (e.g. Saturday) respected. It prefers one session per course
-   per day and an even spread, and explains anything it cannot place. A
-   generated timetable goes through the same review and approval.
 
 ## Pages
 
@@ -47,7 +39,6 @@ Upload ─► Gemini vision reads each page into structured JSON
 | Upload Timetable | Image/PDF upload, extraction with progress, duplicate-file warning |
 | Review Extracted Records | Edit, select and approve records; reasons shown for `check` rows |
 | Schedules & Conflicts | Weekly grid per teacher/class/room, free periods, clash report |
-| Generate Timetable | Constraint-based timetable generation, sent to review |
 | Manage Timetables | All uploads with counts; view as a grid; delete |
 
 ## Project structure
@@ -59,8 +50,8 @@ SmartTimeTable/
 │   ├── genai_assistant.py      # Gemini client, vision adapter, chat tools
 │   ├── database/               # SQLite schema, storage, retrieval
 │   ├── ingestion/              # Vision extraction, validation, OCR cross-check
-│   ├── scheduling/             # Queries, free slots, conflicts, generator
-│   └── ui/                     # Schedules, generator and management pages
+│   ├── scheduling/             # Queries, free slots, conflicts
+│   └── ui/                     # Schedules and management pages
 ├── tests/
 ├── data/                       # timetable.db and uploads (not in Git)
 ├── requirements.txt

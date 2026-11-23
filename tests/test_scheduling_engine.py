@@ -351,6 +351,44 @@ def test_common_free_slots_for_teachers(test_database):
     ]
 
 
+def test_common_free_slots_count_every_spelling_of_a_teacher(test_database):
+    add_entry(teacher="MAMTHA A", start="09:00", end="10:00")
+    add_entry(teacher="MAMATHA A", start="10:00", end="11:00")
+    add_entry(teacher="Dr Sen", start="11:00", end="12:00")
+
+    slots = find_common_free_slots(
+        [["MAMTHA A", "MAMATHA A"], "Dr Sen"],
+        "teacher",
+        "Monday",
+        working_start="09:00",
+        working_end="13:00",
+    )
+
+    assert slots == [
+        {"start_time": "12:00", "end_time": "13:00", "duration_minutes": 60},
+    ]
+
+
+def test_common_free_slots_ignore_lateral_entry_sessions(test_database):
+    add_entry(
+        class_name="CSE-A", start="09:00", end="10:00", entry_type="lateral_entry"
+    )
+    add_entry(class_name="CSE-B", start="11:00", end="12:00")
+
+    slots = find_common_free_slots(
+        ["CSE-A", "CSE-B"],
+        "section",
+        "Monday",
+        working_start="09:00",
+        working_end="13:00",
+    )
+
+    assert slots == [
+        {"start_time": "09:00", "end_time": "11:00", "duration_minutes": 120},
+        {"start_time": "12:00", "end_time": "13:00", "duration_minutes": 60},
+    ]
+
+
 def test_common_free_slots_for_sections(test_database):
     add_entry(class_name="CSE-A", start="09:00", end="10:00")
     add_entry(class_name="CSE-B", start="10:00", end="11:00")

@@ -75,22 +75,6 @@ def test_explorer_page_shows_schedules_free_time_and_clashes(seeded):
     assert monday == "09:55-10:50, 11:05-12:55"  # 10:50 break skipped
 
 
-def test_generator_page_builds_and_sends_a_timetable_to_review(seeded):
-    app = open_page("Generate Timetable")
-    app.selectbox[0].set_value("3A").run()
-    next(b for b in app.button if b.label == "Generate timetable").click().run()
-    assert not app.exception, [error.value for error in app.exception]
-    assert "Placed every session" in texts(app)
-
-    next(b for b in app.button if b.label == "Send to review").click().run()
-    generated = [
-        item for item in db.get_pending_reviews()
-        if item["timetable_id"].startswith("generated_")
-    ]
-    assert len(generated) == 1
-    assert len(generated[0]["payload"]["records"]) == 5
-
-
 def test_duplicate_upload_lookup_and_overview(seeded):
     assert [t["timetable_id"] for t in db.find_timetables_by_hash("abc123")] == ["t3a"]
     assert db.find_timetables_by_hash("other") == []

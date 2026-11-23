@@ -519,7 +519,11 @@ def find_common_free_slots(
     section=None,
     include_needs_review=False,
 ):
-    """Find common free slots for multiple teachers or sections."""
+    """Find common free slots for multiple teachers or sections.
+
+    A teacher may be one name or a list of the same person's spellings and
+    initials, as in ``find_teacher_schedule``.
+    """
 
     if not entities or len(entities) < 2:
         raise ValueError("At least two entities are required")
@@ -540,57 +544,38 @@ def find_common_free_slots(
 
     for entity in entities:
         if entity_type == "teacher":
-            entity_name = entity.strip()
-            if not entity_name:
-                continue
-            query = """
-                SELECT entry.start_time, entry.end_time
-                FROM timetable_entries AS entry
-                WHERE (
-                    LOWER(entry.teacher_name) = LOWER(?)
-                    OR EXISTS (
-                        SELECT 1
-                        FROM entry_teachers AS association
-                        WHERE association.entry_id = entry.id
-                          AND (
-                            LOWER(association.teacher_name) = LOWER(?)
-                            OR LOWER(association.initials) = LOWER(?)
-                          )
-                    )
-                )
-                  AND LOWER(entry.day) = LOWER(?)
-            """
-            params = [entity_name, entity_name, entity_name, day.strip()]
+            rows = find_teacher_schedule(
+                entity,
+                day,
+                semester=semester,
+                section=section,
+                include_needs_review=include_needs_review,
+            )
         else:
+            # Lateral-entry sessions are for diploma students only, so the
+            # rest of the class is free then.
             query = """
                 SELECT start_time, end_time
                 FROM timetable_entries
                 WHERE LOWER(class_name) = LOWER(?)
                   AND LOWER(day) = LOWER(?)
+                  AND COALESCE(entry_type, '') <> 'lateral_entry'
             """
             params = [entity.strip(), day.strip()]
 
-        if semester is not None:
-            query += " AND entry.semester = ?" if entity_type == "teacher" else " AND semester = ?"
-            params.append(semester)
+            if semester is not None:
+                query += " AND semester = ?"
+                params.append(semester)
 
-        if section is not None:
-            query += (
-                " AND LOWER(entry.section) = LOWER(?)"
-                if entity_type == "teacher"
-                else " AND LOWER(section) = LOWER(?)"
-            )
-            params.append(section.strip())
+            if section is not None:
+                query += " AND LOWER(section) = LOWER(?)"
+                params.append(section.strip())
 
-        if not include_needs_review:
-            query += (
-                " AND entry.review_status = 'verified'"
-                if entity_type == "teacher"
-                else " AND review_status = 'verified'"
-            )
+            if not include_needs_review:
+                query += " AND review_status = 'verified'"
 
-        with get_connection() as conn:
-            rows = conn.execute(query, params).fetchall()
+            with get_connection() as conn:
+                rows = conn.execute(query, params).fetchall()
 
         for row in rows:
             start = max(_to_minutes(row["start_time"]), day_start)
