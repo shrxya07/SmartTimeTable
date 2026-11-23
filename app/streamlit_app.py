@@ -30,7 +30,7 @@ from app.ingestion.timetable_validator import (
     class_name_for,
     fill_initials_in_pending_reviews,
 )
-from app.ui import explorer_page, generator_page, manage_page
+from app.ui import explorer_page, manage_page
 from app.ingestion.vision_extractor import SUPPORTED_SUFFIXES
 from app.database.db import (
     TEACHER_OPTIONAL_TYPES,
@@ -132,7 +132,6 @@ page = st.sidebar.radio(
         "Upload Timetable",
         "Review Extracted Records",
         "Schedules & Conflicts",
-        "Generate Timetable",
         "Manage Timetables",
     ],
 )
@@ -1263,14 +1262,11 @@ elif page == "Review Extracted Records":
 
 
 # ============================================================
-# PAGES 4-6: SCHEDULES, GENERATOR, MANAGEMENT
+# PAGES 4-5: SCHEDULES, MANAGEMENT
 # ============================================================
 
 elif page == "Schedules & Conflicts":
     explorer_page.render()
-
-elif page == "Generate Timetable":
-    generator_page.render()
 
 elif page == "Manage Timetables":
     manage_page.render()
