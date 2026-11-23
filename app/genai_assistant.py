@@ -48,6 +48,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 # Extraction needs the stronger model: flash-lite mis-read merged cells.
 VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-3.5-flash")
+# Used only when the vision model stays overloaded (HTTP 5xx); every record
+# still goes through the validator and human review.
+VISION_FALLBACK_MODEL = os.getenv("GEMINI_VISION_FALLBACK_MODEL", MODEL) or None
 # "minimal" thinking matched full accuracy on the sample timetables in
 # about half the time. Set GEMINI_VISION_THINKING= (empty) for the default.
 VISION_THINKING_LEVEL = os.getenv("GEMINI_VISION_THINKING", "minimal") or None
@@ -240,23 +243,57 @@ def gemini_vision_client(
     if not is_ai_available():
         raise RuntimeError(AI_UNAVAILABLE_MESSAGE)
 
-    response = generate_content_with_retry(
-        contents=[
-            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-            prompt,
-        ],
-        config=types.GenerateContentConfig(
-            temperature=0,
-            response_mime_type="application/json",
-            response_schema=response_schema,
-            thinking_config=(
-                types.ThinkingConfig(thinking_level=VISION_THINKING_LEVEL)
-                if VISION_THINKING_LEVEL
-                else None
-            ),
+    contents = [
+        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+        prompt,
+    ]
+    config = types.GenerateContentConfig(
+        temperature=0,
+        response_mime_type="application/json",
+        response_schema=response_schema,
+        thinking_config=(
+            types.ThinkingConfig(thinking_level=VISION_THINKING_LEVEL)
+            if VISION_THINKING_LEVEL
+            else None
         ),
-        model=VISION_MODEL,
     )
+    fallback = (
+        VISION_FALLBACK_MODEL
+        if VISION_FALLBACK_MODEL and VISION_FALLBACK_MODEL != VISION_MODEL
+        else None
+    )
+
+    def call(model, max_attempts=5):
+        try:
+            return generate_content_with_retry(
+                contents=contents,
+                config=config,
+                max_attempts=max_attempts,
+                model=model,
+            )
+        except APIError as error:
+            # Some models reject a thinking level ("MINIMAL is not
+            # supported"); read the page with the model's default instead.
+            if error.code != 400 or "thinking level" not in str(error).lower():
+                raise
+            print(f"{model} does not support this thinking level; using its default.")
+            return generate_content_with_retry(
+                contents=contents,
+                config=config.model_copy(update={"thinking_config": None}),
+                max_attempts=max_attempts,
+                model=model,
+            )
+
+    try:
+        response = call(VISION_MODEL, max_attempts=3 if fallback else 5)
+    except APIError as error:
+        if not fallback or error.code not in (500, 502, 503, 504):
+            raise
+        print(
+            f"{VISION_MODEL} is overloaded (HTTP {error.code}); "
+            f"reading the page with {fallback} instead."
+        )
+        response = call(fallback)
 
     return response.text
 
